@@ -22,16 +22,27 @@ auto get_awaiter(Awaitable &&awaitable) -> decltype(auto) {
         return std::forward<Awaitable>(awaitable);
     }
 }
+
+template<typename Awaitable>
+struct awaitable_traits {
+    using awaiter_t = decltype(detail::get_awaiter(std::declval<Awaitable>()));
+    using awaiter_result_t = decltype(detail::get_awaiter(std::declval<Awaitable>()).await_resume());
+};
+
 }// namespace detail
+
 
 template<typename Awaitable, typename = void>
 struct awaitable_traits {
+    inline static constexpr bool is_awaitable = false;
 };
 
 template<typename Awaitable>
-struct awaitable_traits<Awaitable, std::void_t<decltype(detail::get_awaiter(std::declval<Awaitable>()))>> {
-    using awaiter_t = decltype(detail::get_awaiter(std::declval<Awaitable>()));
-    using awaiter_result_t = decltype(std::declval<awaiter_t>().await_resume());
+struct awaitable_traits<Awaitable, std::void_t<typename detail::awaitable_traits<Awaitable>::awaiter_result_t>> {
+    inline static constexpr bool is_awaitable = true;
+    using awaiter_t = typename detail::awaitable_traits<Awaitable>::awaiter_t;
+    using awaiter_result_t = typename detail::awaitable_traits<Awaitable>::awaiter_result_t;
 };
+
 
 }// namespace nova

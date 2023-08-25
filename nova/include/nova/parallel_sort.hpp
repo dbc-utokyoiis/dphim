@@ -55,7 +55,7 @@ restart:
     co_await schedule();
 
     auto m = first + len / 2;
-    auto lm1 = last - 1;
+    auto lm1 = std::prev(last);
 
     sort3(first, m, lm1, comp);// *first <= *m <= *lm1
 

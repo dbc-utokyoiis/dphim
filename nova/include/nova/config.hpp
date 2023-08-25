@@ -26,7 +26,7 @@ template<typename P>
 struct coroutine_base {
     using promise_type = P;
 
-    coroutine_base() = delete;
+    coroutine_base() = default;
 
     coroutine_base(const coroutine_base &) = delete;
 
@@ -48,10 +48,11 @@ struct coroutine_base {
         }
     }
 
-    auto &get_promise() { return coro.promise(); }
-    const auto &get_promise() const { return coro.promise(); }
+    promise_type &get_promise() { return coro.promise(); }
+    const promise_type &get_promise() const { return coro.promise(); }
 
     bool done() const { return coro.done(); }
+    bool valid() const { return bool(coro); }
 
 protected:
     explicit coroutine_base(coro::coroutine_handle<promise_type> coro)

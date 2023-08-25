@@ -71,6 +71,7 @@ struct numa_info {
                 m_nodes.emplace_back(i);
             }
         }
+        numa_free_nodemask(numamask);
 
         // set distances
         for (auto &node1: m_nodes) {

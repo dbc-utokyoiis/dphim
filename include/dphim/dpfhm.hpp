@@ -134,7 +134,7 @@ public:
                 [this] { return schedule(); });
     }
 
-    auto calcMapFMAP(std::vector<Transaction> &database) -> nova::task<> {
+    auto calcMapFMAP(Database &database) -> nova::task<> {
         using R = std::vector<std::pair<Item, Element>>;
         std::vector<R> ret_list(database.size());
         auto scan_range = [&](auto bg, auto ed) -> nova::task<> {
@@ -152,7 +152,7 @@ public:
                 mapItem2UtilityList[i]->addElement(elm);
     }
 
-    auto calcMapFMAP(std::vector<std::vector<Transaction>> &database) -> nova::task<> {
+    auto calcMapFMAP(std::vector<Database> &database) -> nova::task<> {
         using R = std::vector<std::pair<Item, Element>>;
         std::size_t db_size = 0;
         for (auto &db: database)
@@ -337,7 +337,7 @@ public:
     auto run_impl() -> nova::task<> {
         timer_start();
 
-        auto [database, maxItem] = co_await parseTransactions<do_partitioning>();
+        auto [database, maxItem] = co_await parseTransactions();
 
         std::cout << "Transactions: " << database.size() << std::endl;
         std::cout << "maxItem: " << maxItem << std::endl;

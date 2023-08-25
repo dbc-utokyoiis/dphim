@@ -75,7 +75,7 @@ void ConcurrentLogger::flushOutput() {
 
 
 void ConcurrentLogger::time_point(const std::string &name) {
-    //    std::cout << "time point: " << name << std::endl;
+    std::cout << "time point: " << name << std::endl;
     timer.point(name);
 }
 
@@ -91,8 +91,8 @@ void ConcurrentLogger::print(std::ostream &out) {
     out << "Total time ~: " << tot_time << " ms\n";
     out << "CPU time ~: " << cpu_time << " ms\n";
     out << "CPU Usage ~: " << 1.0 * cpu_time / tot_time << " \n";
-    //    out << "=========== STATISITCS =============\n";
-    //    timer.print(out);
+    out << "=========== STATISITCS =============\n";
+    timer.print(out);
     out << "====================================" << std::endl;
 }
 

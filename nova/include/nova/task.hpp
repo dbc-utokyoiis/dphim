@@ -68,7 +68,7 @@ struct [[nodiscard]] task : coroutine_base<task_promise<T>> {
             : self(self) {}
 
         auto await_ready() const noexcept {
-            return !self->coro || self->coro.done();
+            return !self->valid() || self->done();
         }
 
         auto await_suspend(coro::coroutine_handle<> awaiting) noexcept {

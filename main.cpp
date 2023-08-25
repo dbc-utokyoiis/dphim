@@ -8,6 +8,7 @@
 #include <dphim/dpefim.hpp>
 #include <dphim/dpfhm.hpp>
 #include <dphim/efim.hpp>
+#include <dphim/util/parted_vec.hpp>
 #include <dphim/util/pmem_allocator.hpp>
 
 #include <nova/numa_aware_scheduler.hpp>
@@ -28,10 +29,9 @@ int main(int argc, char *argv[]) {
     parser.add<int>("threads", 't', "# of threads", false, 1);
     parser.add<std::string>("sched", 's', "type of scheduler", false, "local-numa");
     parser.add("mp", '\0', "use memory pool");
+    parser.add("pl", '\0', "use pipeline parallel");
     parser.add<std::string>("pmem", '\0', "which persistent memory is used: [single,numa]", false, "");
     parser.add<std::string>("pmem-alloc", '\0', "what is allocated on persistent memory: [elems,aek,all]", false, "");
-
-    //    parser.add<std::string>("perf_events", '\0', "", false, "");
 
     parser.parse_check(argc, argv);
 
@@ -42,17 +42,15 @@ int main(int argc, char *argv[]) {
     auto threads = parser.get<int>("threads");
     auto sched_type = parser.get<std::string>("sched");
     auto use_mem_pool = parser.exist("mp");
-    //    auto use_parted_database = parser.exist("pdb");
+    auto use_pipeline_parallel = parser.exist("pl");
     auto pmem_type = parser.get<std::string>("pmem");
     auto pmem_alloc_type = parser.get<std::string>("pmem-alloc");
 
-    //    std::cout << std::boolalpha << "Use mem pool: " << use_mem_pool << std::endl;
     std::cout << "pmem type: " << pmem_type << std::endl;
 
     if (threads > long(std::thread::hardware_concurrency())) {
         std::cerr << "# of threads is larger than hardware concurrency: " << std::thread::hardware_concurrency() << std::endl;
     }
-
 
     std::shared_ptr<nova::scheduler_base> sched;
     std::cout << "sched_type: " << sched_type << std::endl;
@@ -80,7 +78,6 @@ int main(int argc, char *argv[]) {
     } else {
         throw std::runtime_error("unknown pmem type: " + pmem_type);
     }
-
 
     dphim::dphim_base::PmemAllocType pat;
     if (pmem_alloc_type == "aek") {
@@ -110,8 +107,8 @@ int main(int argc, char *argv[]) {
             dphim::DPEFIM dpefim(sched, in, out, minutil, threads);
             dpefim.use_parted_database = (sched_type == "dphim");
             dpefim.sched_no_await = (sched_type == "para63");
+            dpefim.pipeline_parallel = use_pipeline_parallel;
             dpefim.set_pmem_path(pmem_paths);
-
             dpefim.pmem_alloc_type = pat;
 
             sched->start();
@@ -132,9 +129,8 @@ int main(int argc, char *argv[]) {
             //
         } else {
             dphim::DPFHM dpfhm(sched, in, out, minutil, threads, sched_type == "dphim");
-            if (threads == 1) {
+            if (threads == 1)
                 dpfhm.sched_no_await = true;
-            }
             dpfhm.set_pmem_path(pmem_paths);
             dpfhm.pmem_alloc_type = pat;
 

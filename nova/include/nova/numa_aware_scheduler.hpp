@@ -27,8 +27,8 @@ struct memory_pool {
         void *get_region() { return reinterpret_cast<void *>(&data[0]); }
     };
 
-    memory_pool(std::vector<std::pair<std::size_t, std::size_t>> config) {
-        for (auto [size, num]: config) {
+    explicit memory_pool(const std::vector<std::pair<std::size_t, std::size_t>> &config) {
+        for (auto &[size, num]: config) {
             header_t *h = nullptr;
             for (auto i = 0ul; i < num; ++i)
                 h = new_node(h, size);

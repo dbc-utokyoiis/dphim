@@ -108,14 +108,11 @@ public:
 #else
 
 struct Transaction {
-
     using Elem = std::pair<Item, Utility>;
-
     Transaction() = default;
 
 private:
     Transaction(const Transaction &) = default;
-
     Transaction &operator=(const Transaction &) = default;
 
 public:
@@ -136,6 +133,7 @@ public:
     auto rend() const noexcept { return std::make_reverse_iterator(begin()); }
     auto size() const noexcept { return elems_size - offset; }
     auto empty() const noexcept { return size() == 0; }
+    auto bytes() const noexcept { return size() * sizeof(Elem); }
 
     template<typename Cond>
     void erase_if(Cond &&cond) {
@@ -179,7 +177,7 @@ public:
 
     template<typename Iter>
     Transaction projection(Iter iter) const {
-        auto ret = *this;
+        auto ret = *this;// ほとんどの時間がここ
         auto utilityE = iter->second;
         ret.prefix_utility += utilityE;
         ret.transaction_utility -= utilityE;
@@ -191,7 +189,7 @@ public:
     }
 
     Transaction clone() const {
-        auto elems = std::shared_ptr<Elem[]>(new Elem[size()]);
+        std::shared_ptr<Elem[]> elems(new Elem[size()]);
         std::copy(begin(), end(), elems.get());
         return Transaction{std::move(elems), size(), size(), 0, transaction_utility, prefix_utility};
     }
@@ -200,7 +198,7 @@ public:
     Transaction
     clone(A &&alloc_func, D &&deleter_factory) const {
         auto *p = reinterpret_cast<Elem *>(alloc_func(sizeof(Elem) * size()));
-        auto elems = std::shared_ptr<Elem[]>(p, deleter_factory(sizeof(Elem) * size()));
+        std::shared_ptr<Elem[]> elems(p, deleter_factory(sizeof(Elem) * size()));
         std::copy(begin(), end(), elems.get());
         return Transaction{std::move(elems), size(), size(), 0, transaction_utility, prefix_utility};
     }

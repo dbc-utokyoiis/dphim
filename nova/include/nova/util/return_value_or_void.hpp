@@ -55,7 +55,7 @@ struct return_value_or_void {
         return data;
     }
 
-    auto result() && -> T {
+    auto result() && -> T && {
         check();
         return std::move(data);
     }

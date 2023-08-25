@@ -84,33 +84,56 @@ std::pair<Transaction, Item> dphim_base::parseOneLine(std::string line, [[maybe_
     return std::make_pair(std::move(tra), max_item);
 }
 
-auto dphim_base::parseFileRange(const char *pathname, off_t bg, off_t ed, int node) -> nova::task<std::pair<Database, Item>> {
+auto dphim_base::parseTransactions() -> nova::task<std::pair<Database, Item>> {
+    struct stat st;
+    if (stat(input_path.c_str(), &st) == -1)
+        throw std::runtime_error(strerror(errno));
+
+    std::vector<nova::task<std::pair<Transactions, Item>>> tasks;
+    auto max_node = sched->get_max_node_id().value_or(0);
+    tasks.reserve(max_node + 1);
+    auto fsize = st.st_size;
+    auto diff = (fsize - 1) / (max_node + 1) + 1;
+    for (int i = 0; i < max_node + 1; ++i) {
+        auto bg = diff * i;
+        auto ed = std::min(diff * (i + 1), fsize + 1);
+        tasks.emplace_back(parseFileRange(input_path.c_str(), bg, ed, i));
+    }
+
+    Database db(tasks.size());
+    Item maxItem = 0;
+    std::size_t i = 0;
+    for (auto &&[trans, mI]: co_await nova::when_all(std::move(tasks))) {
+        maxItem = std::max(mI, maxItem);
+        db.get(i++) = std::move(trans);
+    }
+    co_return std::pair<Database, Item>{std::move(db), maxItem};
+}
+
+auto dphim_base::parseFileRange(const char *pathname, off_t bg, off_t ed, int node) -> nova::task<std::pair<Transactions, Item>> {
 
     co_await schedule();
 
     if (sched->get_current_node_id().has_value() && node > 0) {
-        while (sched->get_current_node_id().value() != node) {
+        while (sched->get_current_node_id().value() != node)
             co_await schedule(node);
-        }
     }
 
-    auto parse_task = [](auto self, auto node, std::vector<std::string> lines) -> nova::task<std::pair<Database, Item>> {
+    auto parse_task = [](auto self, auto node, std::vector<std::string> lines) -> nova::task<std::pair<Transactions, Item>> {
         co_await self->schedule(node);
-
-        Database transactions;
+        Transactions transactions;
         try {
             transactions.reserve(lines.size());
         } catch (std::exception &e) {
             std::cerr << __PRETTY_FUNCTION__ << ": " << __LINE__ << " " << e.what() << " " << lines.size() << std::endl;
         }
         Item I = 0;
-        for (std::size_t i = 0; i < lines.size(); ++i) {
-            auto [tra, mI] = self->parseOneLine(std::move(lines[i]), node);
+        for (auto &line: lines) {
+            auto [tra, mI] = self->parseOneLine(std::move(line), node);
             transactions.push_back(std::move(tra));
             I = std::max(I, mI);
         }
-
-        co_return std::pair<Database, Item>(std::move(transactions), I);
+        co_return std::make_pair(std::move(transactions), I);
     };
 
     int fd = open(pathname, O_RDONLY);
@@ -124,8 +147,8 @@ auto dphim_base::parseFileRange(const char *pathname, off_t bg, off_t ed, int no
     std::string line;
 
     auto launch_type = nova::launch::immediate;
-
-    auto when_all_parse = nova::when_all(std::vector<nova::task<std::pair<Database, Item>>>{});
+    auto when_all_parse = nova::when_all(std::vector<nova::task<std::pair<Transactions, Item>>>{});
+    std::size_t transaction_num = 0;
 
     constexpr std::size_t buf_size = 4092;
     alignas(alignof(std::max_align_t)) char buf[buf_size];
@@ -161,7 +184,8 @@ auto dphim_base::parseFileRange(const char *pathname, off_t bg, off_t ed, int no
                 break;
             }
 
-            if (lines.size() >= 500) {
+            if (lines.size() >= 500) {// parse task size
+                transaction_num += lines.size();
                 when_all_parse.add_task(parse_task(this, node, std::move(lines)), launch_type);
                 lines.clear();
             }
@@ -169,19 +193,19 @@ auto dphim_base::parseFileRange(const char *pathname, off_t bg, off_t ed, int no
         line.insert(line.size(), prev, buf + buf_size - prev);
         offset += bytes_read;
     }
+    close(fd);
 
+    transaction_num += lines.size();
     when_all_parse.add_task(parse_task(this, node, std::move(lines)), launch_type);
 
-    close(fd);
-    auto r = co_await std::move(when_all_parse);
-
-    Database res;
+    Transactions res;
+    res.reserve(transaction_num);
     Item max_item = 0;
-    for (auto &[tras, mI]: r) {
-        res.insert(res.end(), std::make_move_iterator(tras.begin()), std::make_move_iterator(tras.end()));
+    for (auto &&[trans, mI]: co_await std::move(when_all_parse)) {
+        std::copy(std::make_move_iterator(trans.begin()), std::make_move_iterator(trans.end()), std::back_inserter(res));
         max_item = std::max(max_item, mI);
     }
 
-    co_return std::pair<Database, Item>(std::move(res), max_item);
+    co_return std::make_pair(std::move(res), max_item);
 }
 }// namespace dphim

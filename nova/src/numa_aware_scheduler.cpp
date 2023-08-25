@@ -209,9 +209,9 @@ void numa_aware_scheduler::run_worker(int tid) {
     numa_set_localalloc();
     numa_set_strict(true);
 
-    if (use_mem_pool) {
-        mp = std::unique_ptr<memory_pool>(new memory_pool({{136, cpu == 0 ? 100 : 10}, {112, 100}, {120, 100}, {320, 5000}}));
-    }
+    //    if (use_mem_pool) {
+    //        mp = std::unique_ptr<memory_pool>(new memory_pool({{136, cpu == 0 ? 100 : 10}, {112, 100}, {120, 100}, {320, 5000}}));
+    //    }
 
     workers.at(cpu) = std::make_shared<worker>(cpu, *this);
     workers.at(cpu)->run();
@@ -219,6 +219,7 @@ void numa_aware_scheduler::run_worker(int tid) {
 
 numa_aware_scheduler::numa_aware_scheduler(std::size_t thread_num, bool use_mem_pool)
     : scheduler_base(thread_num),
+      info{},
       workers(numa_num_configured_cpus()),
       sleeping_worker_counts(numa_num_configured_nodes()),
       node_local_task_queue(numa_num_configured_nodes()),

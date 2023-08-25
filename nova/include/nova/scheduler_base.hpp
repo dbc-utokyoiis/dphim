@@ -10,6 +10,9 @@
 namespace nova {
 inline namespace scheduler {
 
+inline static constexpr int OPTION_DEFAULT = -1;
+inline static constexpr int OPTION_NO_AWAIT = -2;
+
 struct scheduler_base {
 
     explicit scheduler_base(std::size_t thread_num)
@@ -18,9 +21,6 @@ struct scheduler_base {
     virtual ~scheduler_base() = default;
 
     struct [[nodiscard]] operation : nova::task_base {
-
-        inline static int OPTION_DEFAULT = -1;
-        inline static int OPTION_NO_AWAIT = -2;
 
         explicit operation(nova::scheduler_base *sched, int option)
             : sched(sched), coro{}, option(option) {}
@@ -39,7 +39,7 @@ struct scheduler_base {
         int option = OPTION_DEFAULT;
     };
 
-    auto schedule(int option = operation::OPTION_DEFAULT) -> operation {
+    auto schedule(int option = OPTION_DEFAULT) -> operation {
         return operation{this, option};
     }
 

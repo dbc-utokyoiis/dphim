@@ -17,7 +17,7 @@ std::pair<Transaction, Item> parseTransactionOneLine(std::string line) {
     Transaction tra;
     Item max_item = 0;
     try {
-        std::size_t i = 0, j;
+        std::size_t i = 0, j = 0;
         std::vector<std::pair<Item, Utility>> buf;
         while (i < line.size()) {
             try {

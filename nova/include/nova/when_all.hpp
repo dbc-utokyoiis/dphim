@@ -259,13 +259,13 @@ private:
 };
 
 template<typename... Awaitable>
-auto when_all(Awaitable &&...awaitable) {
+[[nodiscard]] auto when_all(Awaitable &&...awaitable) {
     using TaskContainer = TupleTaskContainer<decltype(make_when_all_task(std::declval<Awaitable>()))...>;
     return when_all_awaitable<TaskContainer>{std::make_tuple(make_when_all_task(std::forward<Awaitable>(awaitable))...)};
 }
 
 template<typename Awaitable>
-auto when_all(std::vector<Awaitable> &&awaitable) {
+[[nodiscard]] auto when_all(std::vector<Awaitable> &&awaitable) {
     using R = typename awaitable_traits<Awaitable>::awaiter_result_t;
     using result_type = std::conditional_t<std::is_rvalue_reference_v<R>, std::remove_reference_t<R>, R>;
     using TaskContainer = VecTaskContainer<result_type>;

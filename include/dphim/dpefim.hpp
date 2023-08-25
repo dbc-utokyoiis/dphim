@@ -11,7 +11,7 @@
 #include <dphim/util/pmem_allocator.hpp>
 #include <dphim/utility_bin_array.hpp>
 
-//#define NOINLINE __attribute__((noinline))
+// #define NOINLINE __attribute__((noinline))
 #define NOINLINE
 
 namespace dphim {
@@ -20,7 +20,7 @@ struct DPEFIM : dphim_base {
 
     bool use_parallel_sort = true;
     bool use_parted_database = false;
-
+    bool pipeline_parallel = false;// or scatter_parallel
 
 private:
     std::vector<Item> oldNameToNewNames;
@@ -54,45 +54,42 @@ private:
 public:
     inline static long MAXIMUM_SIZE_MERGING = 1000;
 
-private:
-#define SCHEDULE co_await schedule()
-
 public:
-    //    using Itemset = std::vector<Item>;
-    using Database = std::vector<Transaction>;
-
     DPEFIM(std::shared_ptr<nova::scheduler_base> sched, const std::string &input_path, const std::string &output_path, Utility minutil, int th_num)
         : dphim_base(std::move(sched), input_path, output_path, minutil, th_num),
           min_util(minutil) {}
 
     auto run() -> nova::task<>;
 
-    template<bool do_partitioning, typename I>
+    template<typename I>
     auto run_impl() -> nova::task<>;
 
     template<typename D>
     auto calcFirstSU(D &database) -> nova::task<std::vector<Utility>>;
 
-    NOINLINE auto calcUtilityAndNextDB(Item x, const std::pair<DPEFIM::Database::const_iterator, DPEFIM::Database::const_iterator> transactionRange, int node = -1)
-            -> std::pair<Utility, DPEFIM::Database>;
+    template<typename T>
+    NOINLINE auto calcUtilityAndNextDB(Item x, T &&db, [[maybe_unused]] int node = -1) -> std::pair<Utility, std::remove_cvref_t<T>>;
 
     template<typename D, typename I>
-    auto search(const I &prefix, const D &transactionsOfP, const I &itemsToKeep, const I &itemsToExplore) {
+    auto search(const I &prefix, const D &transactionsOfP, I &&itemsToKeep, I &&itemsToExplore) {
         incCandidateCount(itemsToExplore.size());
         std::vector<nova::task<>> tasks;
         tasks.reserve(itemsToExplore.size());
         for (int j = 0; j < int(itemsToExplore.size()); ++j) {
-            tasks.push_back(searchX(j, prefix, transactionsOfP, itemsToKeep, itemsToExplore));
+            tasks.emplace_back(searchX(j, prefix, transactionsOfP, itemsToKeep, itemsToExplore));
         }
         return nova::when_all(std::move(tasks));
     }
 
+    template<typename D, typename I, typename I2>
+    auto searchX(int j, I &&prefix, const D &transactionsOfP, I2 &&itemsToKeep, I2 &&itemsToExplore) -> nova::task<>;
+
     template<typename D, typename I>
-    auto searchX(int j, const I &prefix, const D &transactionsOfP, const I &itemsToKeep, const I &itemsToExplore) -> nova::task<>;
+    void calcUpperBoundsImpl(UtilityBinArray &ub, std::size_t j, const D &db, const I &itemsToKeep) const;
 
     template<bool do_partitioning, typename D, typename I>
-    auto calcUpperBounds(std::size_t j, const D &transactionsPx, const I &itemsToKeep) const
-            -> std::conditional_t<do_partitioning, UtilityBinArray, const UtilityBinArray &>;
+    NOINLINE auto calcUpperBounds(std::size_t j, const D &transactionsPx, const I &itemsToKeep) const
+            -> std::conditional_t<do_partitioning, UtilityBinArray, UtilityBinArray &>;
 };
 
 }// namespace dphim
