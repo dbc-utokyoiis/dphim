@@ -38,9 +38,6 @@ struct PairMap {
     void set_size(std::size_t size) {
         assert(m_size == 0);
         m_size = size;
-
-        std::cout << size << " " << raw_size() << " " << part_num() << " " << part_size() << std::endl;
-        std::cout << part_num() * part_size() << std::endl;
     }
 
     void reserve(std::size_t pid = 0) {

@@ -13,11 +13,11 @@ struct wait_group {
     wait_group &operator=(const wait_group &) = delete;
     wait_group &operator=(wait_group &&) = delete;
 
-    explicit wait_group(coro::coroutine_handle<> continuation = nullptr)
-        : continuation(continuation), count(1) {}
+    explicit wait_group(coro::coroutine_handle<> continuation = nullptr, int count = 1)
+        : continuation(continuation), count(count) {}
 
     auto is_ready() const noexcept -> bool {
-        return static_cast<bool>(continuation) && !continuation.done();
+        return continuation && !continuation.done();
     }
 
     // return true if c is resumed immediately
@@ -27,11 +27,11 @@ struct wait_group {
     }
 
     auto add(std::size_t n = 1) noexcept -> void {
-        count.fetch_add(n, std::memory_order_release);
+        count.fetch_add(n, MEM_ORDER_REL);
     }
 
     auto done() -> bool {
-        auto remain = count.fetch_sub(1, std::memory_order_acquire) - 1;
+        auto remain = count.fetch_sub(1, MEM_ORDER_ACQ_REL) - 1;
         if (remain == 0 && is_ready()) {
             continuation.resume();// *this maybe destructed from resume()
             return true;
@@ -41,7 +41,7 @@ struct wait_group {
 
 private:
     coro::coroutine_handle<> continuation;
-    std::atomic<size_t> count;
+    std::atomic<int> count;
 };
 
 }// namespace nova

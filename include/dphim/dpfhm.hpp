@@ -98,10 +98,10 @@ struct UtilityList_ {
     }
 };
 
-struct DPFHM : dphim_base {
+struct DPFHM : DphimBase {
 
     DPFHM(std::shared_ptr<nova::scheduler_base> sched, std::string input_path, std::string output_path, Utility minutil, int th_num, bool do_partitioning = true)
-        : dphim_base(sched, std::move(input_path), std::move(output_path), minutil, th_num),
+        : DphimBase(sched, std::move(input_path), std::move(output_path), minutil, th_num),
           do_partitioning(do_partitioning),
           mapFMAP(do_partitioning ? sched->get_max_node_id().value_or(0) + 1 : 1) {}
 
@@ -208,7 +208,7 @@ public:
                 auto p = std::make_pair(std::distance(std::begin(listOfUtilityLists), utilityListOfI1), std::distance(std::begin(listOfUtilityLists), utilityListOfI2));
                 if (p.first == p.second)
                     continue;
-                mapFMAP.at_raw(p).atomic_insert_or_add(newTWU, std::memory_order_relaxed);
+                mapFMAP.at_raw(p).atomic_insert_or_add(newTWU, MEM_ORDER_RELAXED);
             }
         }
         co_return ret;
@@ -339,14 +339,19 @@ public:
 
         auto [database, maxItem] = co_await parseTransactions();
 
-        std::cout << "Transactions: " << database.size() << std::endl;
-        std::cout << "maxItem: " << maxItem << std::endl;
+        if (is_debug_mode()) {
+            std::cerr << "Transactions: " << database.size() << std::endl;
+            std::cerr << "maxItem: " << maxItem << std::endl;
+        }
         time_point("parse");
 
         auto [mapTWU, items] = co_await calcTWU<decltype(items2Keep)>(database, maxItem);
         mapItem2TWU = std::move(mapTWU);
         items2Keep = std::move(items);
-        std::cout << "itemsToKeep.size(): " << items2Keep.size() << std::endl;
+
+        if (is_debug_mode()) {
+            std::cerr << "itemsToKeep.size(): " << items2Keep.size() << std::endl;
+        }
         time_point("calcTWU");
 
         co_await calcListOfUtilityLists();
@@ -355,8 +360,6 @@ public:
         for (auto it = listOfUtilityLists.begin(); it < listOfUtilityLists.end(); ++it) {
             mapItem2UtilityList[it->item] = it;
         }
-
-        std::cout << mapFMAP.part_num() << std::endl;
 
         mapFMAP.set_size(maxItem + 1);
 
@@ -368,7 +371,6 @@ public:
             if (pmem_alloc_type == PmemAllocType::None) {
                 mapFMAP.reserve(pid);
             } else {
-
 #ifdef DPHIM_PMEM
                 auto pmem_allocator = get_pmem_allocator();
                 mapFMAP.reserve(

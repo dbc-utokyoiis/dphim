@@ -1,26 +1,63 @@
 #include <dphim/dpefim.hpp>
 #include <dphim/parse.hpp>
 
+#include <nova/jemalloc.hpp>
 #include <nova/numa_aware_scheduler.hpp>
 #include <nova/parallel_sort.hpp>
+
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
 
 namespace dphim {
 
 template<typename I>
 auto DPEFIM::run_impl() -> nova::task<> {
+
+    if (is_debug_mode()) {
+        std::cerr << "scatter_type: " << scatter_type << std::endl;
+        std::cerr << "speculation thresholds: " << std::endl;
+        std::cerr << "  alpha1: " << thresholds.step1_scatter_alloc_threshold << std::endl;
+        std::cerr << "  beta1: " << thresholds.step1_task_migration_threshold << std::endl;
+        std::cerr << "  beta2: " << thresholds.step2_task_migration_threshold << std::endl;
+        std::cerr << "  alpha3: " << thresholds.step3_scatter_alloc_threshold << std::endl;
+        std::cerr << "  beta3: " << thresholds.step3_task_migration_threshold << std::endl;
+    }
+
     timer_start();
 
-    auto [database, mI] = co_await parseTransactions();
+    auto [database, mI] = co_await parseTransactions([this](std::size_t fsize) {
+        auto ret = fsize > this->thresholds.step1_scatter_alloc_threshold
+                           ? sched->get_max_node_id().value_or(0) + 1
+                           : 1;
+        if (is_debug_mode()) {
+            std::cerr << "  input file size: " << fsize << " bytes\n";
+            std::cerr << "  alpha1 threshold: " << thresholds.step1_scatter_alloc_threshold << '\n';
+            std::cerr << "  partition num: " << ret << std::endl;
+        }
+        return ret;
+    });
+    partition_num = database.partition_num();
     maxItem = mI;
 
-    std::cout << "database.size(): " << database.size() << std::endl;
-    std::cout << "Partition size: " << database.partition_size() << std::endl;
-    std::cout << "maxItem: " << maxItem << std::endl;
+
     time_point("parse");
+    if (is_debug_mode()) {
+        std::cerr << "  # of transactions: " << database.size() << std::endl;
+        std::cerr << "  # of partitions: " << database.partition_num() << std::endl;
+        std::cerr << "  maxItem: " << maxItem << std::endl;
+    }
 
     auto [LU, itemsToKeep] = co_await calcTWU<I>(database, maxItem);
-    std::cout << "itemsToKeep.size(): " << itemsToKeep.size() << std::endl;
     time_point("calcTWU");
+    if (is_debug_mode()) {
+        std::cerr << " # of itemsToKeep: " << itemsToKeep.size() << std::endl;
+        for (std::size_t i = 0; i < database.partition_num(); ++i) {
+            std::cerr << "  database@node" << i << ": "
+                      << "size=" << database.get(i).size()
+                      << "(" << database.get(i).get_sum_value() / 1000 << " kB)" << std::endl;
+        }
+    }
 
     // set new name
     oldNameToNewNames.resize(maxItem + 1, 0);
@@ -34,32 +71,61 @@ auto DPEFIM::run_impl() -> nova::task<> {
     }
     maxItem = currentName;
 
+
     // remove unpromising elems and rename elems from old names to new names
     co_await for_each_batched(
             database,
-            [this](Transaction &transaction) {
+            [this](Transaction &transaction, auto /*part_id*/) {
                 for (auto &[item, util]: transaction)
                     item = oldNameToNewNames[item];
                 transaction.erase_if([&](const auto &p) { return p.first == 0; });// remove invalid name
                 std::sort(transaction.begin(), transaction.end(),
                           [&](const auto &l, const auto &r) { return l.first < r.first; });
             },
-            [this](auto node_id) { return schedule(node_id); },
+            [this](auto node_id, auto bg, auto ed) {
+                auto range = PrefixSumRange(bg, ed);
+                if (range.get_sum_value() > thresholds.step2_task_migration_threshold) {
+                    return schedule(node_id);
+                } else {
+                    return schedule();
+                }
+            },
             500);
 
     using std::erase_if;
+    auto pre_size = database.size();
     erase_if(database, [](const Transaction &t) { return t.empty(); });
+    if (is_debug_mode()) {
+        std::cerr << "remove item with TWU under minutil" << std::endl;
+        std::cerr << "  # of transactions: " << pre_size << " -> " << database.size() << std::endl;
+    }
 
     auto comp = [](auto &l, auto &r) {
         return std::lexicographical_compare(
                 r.rbegin(), r.rend(), l.rbegin(), l.rend(), [](auto &l, auto &r) { return l.first < r.first; });
     };
+
+    if (is_debug_mode()) {
+        std::cerr << "sort transactions" << std::endl;
+        std::cerr << "  " << (use_parallel_sort ? "parallel sort" : "simple sort") << std::endl;
+    }
+
     if (use_parallel_sort) {
-        co_await nova::parallel_sort(database.begin(), database.end(), comp, [this] { return schedule(); });
+        std::vector<nova::task<>> tasks;
+        for (std::size_t i = 0; i < database.partitions().size(); ++i) {
+            auto &part = database.get(i);
+            tasks.push_back(nova::parallel_sort(
+                    part.begin(), part.end(), comp, [](auto self, auto node) { return self->schedule(node); }, this, i));
+        }
+        co_await nova::when_all(std::move(tasks));
     } else {
         std::sort(database.begin(), database.end(), comp);
     }
 
+    for (std::size_t i = 0; i < database.partitions().size(); ++i) {
+        auto &part = database.get(i);
+        part.recalc();
+    }
     auto SU = co_await calcFirstSU(database);
 
     I itemsToExplore;
@@ -67,6 +133,25 @@ auto DPEFIM::run_impl() -> nova::task<> {
         if (SU[item] >= min_util)
             itemsToExplore.emplace_back(item);
     time_point("Build");
+
+    if (is_debug_mode()) {
+        std::cerr << "  # of itemsToExplore: " << itemsToExplore.size() << std::endl;
+        for (std::size_t i = 0; i < database.partition_num(); ++i) {
+            std::cerr << "  database@node" << i << ": "
+                      << "size=" << database.get(i).size()
+                      << "(" << database.get(i).get_sum_value() / 1000 << " kB)" << std::endl;
+        }
+    }
+
+    // this->repartition(database);
+
+    if (is_debug_mode()) {
+        std::cerr << "Thresholds: " << std::endl;
+        std::cerr << "  scatter_alloc_threshold: " << thresholds.step3_scatter_alloc_threshold << std::endl;
+        std::cerr << "  task_migration_threshold: " << thresholds.step3_task_migration_threshold << std::endl;
+        std::cerr << "  stop_scatter_alloc_depth: " << thresholds.step3_stop_scatter_alloc_depth << std::endl;
+        std::cerr << "  stop_task_migration_depth: " << thresholds.step3_stop_task_migration_depth << std::endl;
+    }
 
     sched_no_await = false;
     co_await search({}, std::move(database), std::move(itemsToKeep), std::move(itemsToExplore));
@@ -90,43 +175,34 @@ auto DPEFIM::run() -> nova::task<> {
 
 template<typename D>
 auto DPEFIM::calcFirstSU(D &database) -> nova::task<std::vector<Utility>> {
-    //    if constexpr (std::is_same_v<std::remove_cvref_t<D>, Database>) {
+
+    if (is_debug_mode()) {
+        std::cerr << "calcFirstSU" << std::endl;
+        std::cerr << " scatter threshold: " << thresholds.step2_task_migration_threshold << std::endl;
+    }
+
     std::vector<Utility> utils(maxItem + 1);
+
     co_await for_each_batched(
-            database, [&](auto &transaction) {
+            database, [&](auto &transaction, auto /*part_id*/) {
             Utility sumSU = 0;
             for (auto i = transaction.rbegin(); i != transaction.rend(); ++i) {
                 auto [item, utility] = *i;
                 sumSU += utility;
-                auto p = reinterpret_cast<std::atomic<Utility> *>(&utils[item]);
-                std::launder(p)->fetch_add(sumSU, std::memory_order_relaxed);
-            } }, [this](auto i) { return schedule(i); }, 500);
+                // auto p = reinterpret_cast<std::atomic<Utility> *>(&utils[item]);
+                // std::launder(p)->fetch_add(sumSU, MEM_ORDER_RELAXED);
+                std::atomic_ref(utils[item]).fetch_add(sumSU, MEM_ORDER_RELAXED);
+            } },
+            [this](auto i, auto bg, auto ed) {
+                auto range = PrefixSumRange(bg, ed);
+                if (range.get_sum_value() > thresholds.step2_task_migration_threshold) {
+                    return schedule(i);
+                } else {
+                    return schedule();
+                }
+            },
+            500);
     co_return utils;
-    //    } else {
-    //        std::vector<std::vector<Utility>> utils(database.size());
-    //        co_await scatter(database, [this, &utils](auto & /*db*/, auto node) {
-    //            utils[node].resize(maxItem + 1);
-    //        });
-    //        co_await parallel_by_static_partitioning(database, [&](Transaction &transaction, int node) {
-    //            Utility sumSU = 0;
-    //            for (auto i = transaction.rbegin(); i != transaction.rend(); ++i) {
-    //                auto [item, utility] = *i;
-    //                sumSU += utility;
-    //                auto p = reinterpret_cast<std::atomic<Utility> *>(&utils[node][item]);
-    //                std::launder(p)->fetch_add(sumSU, std::memory_order_relaxed);
-    //            }
-    //        });
-    //        auto cur_node_id = sched->get_current_node_id().value();
-    //        auto max_node_id = sched->get_max_node_id().value();
-    //        for (auto node = 0; node <= max_node_id; ++node) {
-    //            if (node == cur_node_id)
-    //                continue;
-    //            for (auto i = 0ul; i <= maxItem; ++i) {
-    //                utils[cur_node_id][i] += utils[node][i];
-    //            }
-    //        }
-    //        co_return utils[cur_node_id];
-    //    }
 }
 
 template<typename D, typename I, typename I2>
@@ -136,18 +212,26 @@ auto DPEFIM::searchX(int j, I &&prefix, const D &transactionsOfP, I2 &&itemsToKe
         co_await schedule();
 
     auto x = itemsToExplore[j];
+    auto depth = prefix.size();
 
     Utility utilityPx = 0;
-    D transactionPx(transactionsOfP.partitions().size());
+    D transactionPx(transactionsOfP.partition_num());
 
-    auto ret = co_await partition_map(
-            transactionsOfP,
-            [&, x](auto &db, auto node) { return calcUtilityAndNextDB(x, db, node); },
-            [this](auto node) { return schedule(node); } /*, cond*/);
-
-    for (std::size_t nid = 0; nid < ret.size(); ++nid) {
-        utilityPx += ret[nid].first;
-        transactionPx.get(nid) = std::move(ret[nid].second);
+    for (auto &&[util, db]:
+         co_await partition_map(
+                 transactionsOfP,
+                 [this, depth, x](auto &db, auto node) {
+                     return calcUtilityAndNextDB(x, db, node, depth < thresholds.step3_stop_task_migration_depth);
+                 },
+                 [this]([[maybe_unused]] auto &part, std::size_t node) {
+                     return schedule(static_cast<int>(node));
+                 },
+                 [this, depth](auto &part, auto /*id*/) {
+                     return depth < thresholds.step3_stop_task_migration_depth &&
+                            part.get_sum_value() > thresholds.step3_task_migration_threshold;
+                 })) {
+        utilityPx += util;
+        transactionPx.merge(std::move(db));
     }
 
     auto makeNewItems = [j, min_util = min_util](auto &&ub, auto &&K) {
@@ -166,12 +250,16 @@ auto DPEFIM::searchX(int j, I &&prefix, const D &transactionsOfP, I2 &&itemsToKe
         return std::make_tuple(std::move(newK), std::move(newE));
     };
 
-    std::remove_cvref_t<I2> newK, newE;
-    auto &ub = calcUpperBounds<false>(j, transactionPx.get(0), itemsToKeep);
-    for (std::size_t nid = 1; nid < transactionPx.partition_size(); ++nid) {
+    UtilityBinArray ub;
+    for (std::size_t nid = 0; nid < transactionPx.partition_num(); ++nid) {
         auto &db = transactionPx.get(nid);
+        if (depth < thresholds.step3_stop_task_migration_depth &&
+            db.get_sum_value() > thresholds.step3_task_migration_threshold)
+            co_await schedule(nid);
         calcUpperBoundsImpl(ub, j, db, itemsToKeep);
     }
+
+    std::remove_cvref_t<I2> newK, newE;
     std::tie(newK, newE) = makeNewItems(ub, itemsToKeep);
 
     if (utilityPx >= min_util || !newE.empty()) {
@@ -195,19 +283,28 @@ __attribute__((noinline)) auto my_lower_bound(Args &&...args) {
 }
 
 template<typename T>
-auto DPEFIM::calcUtilityAndNextDB(Item x, T &&db, [[maybe_unused]] int node) -> std::pair<Utility, std::remove_cvref_t<T>> {
-    // remote read: \sum log(transaction.size()) + transaction.size()
-    using DB = std::remove_cvref_t<T>;
+auto DPEFIM::calcUtilityAndNextDB(Item x, T &&db, int node, bool allow_scatter) -> std::pair<Utility, Database> {
+    std::size_t alloc_size = 0;
 
     Utility utilityPx = 0;
-    DB transactionPx;
-    transactionPx.reserve(db.size());
+    Database ret(partition_num);
+
+    [[maybe_unused]] auto try_aggresive_merge = [&ret](const Transaction &projected) {
+        for (std::size_t i = 0; i < ret.size(); ++i) {
+            auto &tra = ret[i];
+            if (tra && projected.compare_extension(tra)) {
+                tra.merge(projected);
+                return true;
+            }
+        }
+        return false;
+    };
 
     int consecutive_merge_count = 0;
-    Transaction previousTransaction;
+    Transaction prevTransaction;
+    int allocNode = node;
 
     for (auto &transaction: db) {
-        // read: log(transaction.size())
         auto iterX = my_lower_bound(
                 transaction.begin(), transaction.end(), Transaction::Elem{x, 0},
                 [](const auto &l, const auto &r) { return l.first < r.first; });
@@ -217,54 +314,45 @@ auto DPEFIM::calcUtilityAndNextDB(Item x, T &&db, [[maybe_unused]] int node) -> 
         } else {
             auto projected = transaction.projection(iterX);
             utilityPx += projected.prefix_utility;
-            if (DPEFIM::MAXIMUM_SIZE_MERGING >= std::distance(iterX, transaction.end())) {
-                if (!previousTransaction) {
-                    previousTransaction = std::move(projected);
-                } else if (projected.compare_extension(previousTransaction)) {// read: 2 * transaction.size() ?
-                    if (consecutive_merge_count == 0) {
-                        if (pmem_alloc_type != PmemAllocType::None) {
-#ifdef DPHIM_PMEM
-                            auto pmem_allocator = get_pmem_allocator(node < 0 ? std::nullopt : std::optional(node));
-                            previousTransaction = previousTransaction.clone(
-                                    [=](auto size) { return pmem_allocator->alloc(size); },
-                                    [=]([[maybe_unused]] auto size) {
-                                        return [=](auto *p) {
-                                            using U = std::remove_pointer_t<std::remove_cvref_t<decltype(p)>>;
-                                            p->~U();
-                                            pmem_allocator->dealloc(p);
-                                        };
-                                    });
-#else
-                            throw std::runtime_error("pmem is unsupported ");
-#endif
-                        } else {
-                            previousTransaction = previousTransaction.clone();// write
-                        }
+            if (!prevTransaction) {
+                prevTransaction = std::move(projected);
+                // } else if (try_aggresive_merge(projected)) {
+                // pass
+            } else if (projected.compare_extension(prevTransaction)) {
+                if (consecutive_merge_count == 0) {
+                    if (allow_scatter && (alloc_size > this->thresholds.step3_scatter_alloc_threshold / partition_num)) {
+                        // scatter
+                        allocNode = (allocNode + 1) % partition_num;
+                        prevTransaction = this->cloneTransaction(prevTransaction, allocNode);
+                        addMalloc(prevTransaction.bytes());
+                        alloc_size += prevTransaction.bytes();
+                    } else {
+                        // non scatter
+                        prevTransaction = this->cloneTransaction(prevTransaction, std::nullopt);
+                        allocNode = node;
+                        addMalloc(prevTransaction.bytes());
+                        alloc_size += prevTransaction.bytes();
                     }
-                    previousTransaction.merge(std::move(projected));
-                    consecutive_merge_count++;
-                } else {
-                    transactionPx.push_back(std::move(previousTransaction));
-                    previousTransaction = std::move(projected);
-                    consecutive_merge_count = 0;
                 }
+                prevTransaction.merge(std::move(projected));
+                consecutive_merge_count++;
             } else {
-                transactionPx.push_back(std::move(projected));
+                ret.get(allocNode).push_back(std::move(prevTransaction));
+                prevTransaction = std::move(projected);
+                consecutive_merge_count = 0;
             }
         }
     }
 
-    if (previousTransaction)
-        transactionPx.push_back(std::move(previousTransaction));
+    if (prevTransaction)
+        ret.get(allocNode).push_back(std::move(prevTransaction));
 
-    return std::make_pair(utilityPx, std::move(transactionPx));
+    return std::make_pair(utilityPx, std::move(ret));
 }
 
 
 template<typename D, typename I>
 void DPEFIM::calcUpperBoundsImpl(UtilityBinArray &ub, std::size_t j, const D &db, const I &itemsToKeep) const {
-    // remote read: \sum transaction.size()
-    // local write: \sum transaction.size()
     if (ub.size() == 0)
         ub.reset(itemsToKeep[j], itemsToKeep.back());
     for (const auto &transaction: db) {
@@ -292,10 +380,53 @@ auto DPEFIM::calcUpperBounds(std::size_t j, const D &transactionsPx, const I &it
         calcUpperBoundsImpl(utilityBinArray, j, transactionsPx, itemsToKeep);
         return utilityBinArray;
     } else {
-        static thread_local UtilityBinArray utilityBinArray;
+        thread_local UtilityBinArray utilityBinArray;
         utilityBinArray.reset(itemsToKeep[j], itemsToKeep.back());
         calcUpperBoundsImpl(utilityBinArray, j, transactionsPx, itemsToKeep);
         return utilityBinArray;
     }
 }
+
+double DPEFIM::balanceCheck(const Database &database) const {
+    std::size_t min = std::numeric_limits<std::size_t>::max();
+    std::size_t max = 0;
+    for (std::size_t i = 0; i < database.partition_num(); ++i) {
+        min = std::min(min, database.get(i).get_sum_value());
+        max = std::max(max, database.get(i).get_sum_value());
+    }
+    return static_cast<double>(max) / min;
+}
+
+void DPEFIM::repartition(Database &database) {
+    using namespace std::chrono;
+    auto st = high_resolution_clock::now();
+    auto ranges = database.balanced_partitions([](auto bg, auto ed) {
+        return PrefixSumRange(bg, ed).get_sum_value();
+    });
+    database.repartition(ranges, [this](auto &vec, auto &&v, std::size_t src, std::size_t dest) {
+        if (src == dest) {
+            vec.push_back(std::forward<decltype(v)>(v));
+        } else {
+            auto cpu = sched->get_corresponding_cpu_id(dest);
+            vec.push_back(v.clone([this, cpu](auto size) {
+                if (cpu) {
+                    return nova::malloc_on_thread(size, *cpu);
+                } else {
+                    return std::malloc(size);
+                }
+            }));
+        }
+    });
+    if (is_debug_mode()) {
+        std::cerr << "repartition: "
+                  << duration_cast<microseconds>(high_resolution_clock::now() - st).count()
+                  << " us" << std::endl;
+        for (std::size_t i = 0; i < database.partition_num(); ++i) {
+            std::cerr << "  database@node" << i << ": "
+                      << "size=" << database.get(i).size()
+                      << "(" << database.get(i).get_sum_value() / 1000 << " kB)" << std::endl;
+        }
+    }
+}
+
 }// namespace dphim

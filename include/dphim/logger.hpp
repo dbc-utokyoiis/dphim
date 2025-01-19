@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <fstream>
 #include <list>
 #include <mutex>
@@ -56,11 +57,24 @@ private:
 };
 
 struct ConcurrentLogger {
-    explicit ConcurrentLogger(const std::string &output_path, Utility min_util, std::size_t thread_num);
+    explicit ConcurrentLogger(const std::string &output_path, Utility min_util, std::size_t thread_num, bool is_debug = false);
+
+    void register_thread() {
+        timer.register_thread();
+    }
 
     void incCandidateCount(std::size_t n) {
         static thread_local auto candidate = candidate_count.local_value();
         *candidate += n;
+    }
+
+    void addMalloc(std::size_t n) {
+        if (is_debug) {
+            static thread_local auto log = malloc_log.local_value();
+            static thread_local auto m_count = malloc_count.local_value();
+            *log += n;
+            *m_count += 1;
+        }
     }
 
     template<typename I>
@@ -75,10 +89,16 @@ struct ConcurrentLogger {
         }
     }
 
-    void timer_start() { timer.start(); }
+    void timer_start() {
+        if (is_debug) {
+            std::cerr << "timer start" << std::endl;
+        }
+        timer.start();
+    }
     void time_point(const std::string &name);
 
     void print(std::ostream &out);
+    void print_json(std::ostream &out);
     void flushOutput();
 
 private:
@@ -87,15 +107,15 @@ private:
 protected:
     Utility min_util;
     std::size_t thread_num;
+    bool output_is_null = false;
+    bool is_debug = false;
 
 private:
     ConcurrentCounter<std::size_t> candidate_count, hui_count;
     std::atomic<std::size_t> res_tid = 0;
     std::vector<std::list<std::pair<std::vector<Item>, Utility>>> results;
-
+    ConcurrentCounter<std::size_t> malloc_log, malloc_count;
     TimeMeasure timer;
-
-    bool output_is_null = false;
 };
 
 }// namespace dphim

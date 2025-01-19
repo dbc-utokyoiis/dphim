@@ -44,5 +44,11 @@ struct awaitable_traits<Awaitable, std::void_t<typename detail::awaitable_traits
     using awaiter_result_t = typename detail::awaitable_traits<Awaitable>::awaiter_result_t;
 };
 
+struct always_true {
+    template<typename Ts>
+    constexpr bool operator()(Ts &&...) const {
+        return true;
+    }
+};
 
 }// namespace nova

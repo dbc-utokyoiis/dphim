@@ -17,9 +17,9 @@ struct single_queue_scheduler::worker_t : worker_base<worker_t> {
         : base(worker_id), sched(std::addressof(sched)) {}
 
     void try_sleep() {
-        sched->sleeping_worker_count.fetch_add(1, std::memory_order_relaxed);
+        sched->sleeping_worker_count.fetch_add(1, MEM_ORDER_RELAXED);
         base::try_sleep();
-        sched->sleeping_worker_count.fetch_sub(1, std::memory_order_release);
+        sched->sleeping_worker_count.fetch_sub(1, MEM_ORDER_REL);
     }
 
 private:
@@ -58,7 +58,7 @@ void single_queue_scheduler::post(task_base *op, int /*option*/) {
         global_task_queue.push(op);
     }
 
-    if (sleeping_worker_count.load(std::memory_order_acquire) > 0) {
+    if (sleeping_worker_count.load(MEM_ORDER_ACQ) > 0) {
         for (auto &w: workers)
             if (w && w->try_wake_up())
                 return;

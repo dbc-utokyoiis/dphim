@@ -30,7 +30,7 @@ struct os_thread_scheduler : scheduler_base {
 
         pthread_attr_init(&attr);
         if (auto err = pthread_attr_setstacksize(&attr, 2 * PTHREAD_STACK_MIN); err != 0) {
-            std::cout << "[os_thread_scheduler] Error: " << strerror(err) << std::endl;
+            std::cerr << "[os_thread_scheduler] Error: " << strerror(err) << std::endl;
             std::abort();
         }
         pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
@@ -41,7 +41,7 @@ struct os_thread_scheduler : scheduler_base {
                     },
                     op);
             err != 0) {
-            std::cout << "[os_thread_scheduler] Error: " << strerror(err) << std::endl;
+            std::cerr << "[os_thread_scheduler] Error: " << strerror(err) << std::endl;
             std::abort();
         }
     }

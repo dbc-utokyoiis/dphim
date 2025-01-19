@@ -4,7 +4,6 @@
 #include <cstddef>
 #include <cstring>
 #include <fcntl.h>
-#include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -24,11 +23,12 @@ std::pair<Transaction, Item> parseTransactionOneLine(std::string line) {
                 auto item = static_cast<Item>(std::stol(line.data() + i, &j));
                 max_item = std::max(max_item, item);
                 i += j + 1;
-                buf.push_back({item, 0});
+                buf.emplace_back(item, 0);
                 if (line[i - 1] == ':')
                     break;
             } catch (std::invalid_argument &e) {
                 std::cerr << e.what() << ": " << __LINE__ << " " << line << std::endl;
+                throw e;
             }
         }
 
@@ -41,6 +41,7 @@ std::pair<Transaction, Item> parseTransactionOneLine(std::string line) {
             tra.transaction_utility = static_cast<Utility>(std::stol(line.data() + i, &j));
         } catch (std::invalid_argument &e) {
             std::cerr << e.what() << ": " << __LINE__ << " " << line << std::endl;
+            throw e;
         }
 
         i += j + 1;
@@ -64,7 +65,7 @@ std::pair<Transaction, Item> parseTransactionOneLine(std::string line) {
 }
 
 std::pair<std::vector<Transaction>, Item> parseTransactions(const std::string &input_path) {
-    int fd = open(input_path.c_str(), O_RDONLY);
+    const int fd = open(input_path.c_str(), O_RDONLY);
     if (fd == -1)
         throw std::runtime_error(strerror(errno));
 

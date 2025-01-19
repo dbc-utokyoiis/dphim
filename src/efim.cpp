@@ -6,7 +6,8 @@
 #include <unistd.h>
 
 #include <algorithm>
-#include <execution>
+#include <random>
+#include <ranges>
 #include <thread>
 #include <vector>
 
@@ -18,6 +19,19 @@
 namespace dphim {
 
 void EFIM::run() {
+    if (pmem_alloc_type == PmemAllocType::AEK) {
+#ifdef DPHIM_PMEM
+        run_impl<std::vector<Item, local_pmem_allocator<Item>>>();
+#else
+        throw std::runtime_error("pmem is unsupported ");
+#endif
+    } else {
+        run_impl<std::vector<Item>>();
+    }
+}
+
+template<typename I>
+void EFIM::run_impl() {
     timer_start();
 
     auto [database, mI] = parseTransactions(input_path);
@@ -89,26 +103,178 @@ void EFIM::run() {
             itemsToExplore.push_back(item);
     time_point("Build");
 
+
     if (thread_num <= 1) {
         search(database, itemsToKeep, itemsToExplore, {});
     } else {
-        std::vector<std::thread> threads;
-        threads.reserve(thread_num);
-        auto d = (itemsToExplore.size() - 1) / thread_num + 1;
-        incCandidateCount(itemsToExplore.size());
-        for (auto i = 0u; i < itemsToExplore.size(); i += d) {
-            threads.emplace_back(
-                    [this, i, ed = std::min<std::size_t>(i + d, itemsToExplore.size()), &itemsToKeep, &itemsToExplore, &database = database]() {
-                        for (auto j = i; j < ed; ++j) {
-                            searchX(j, database, itemsToKeep, itemsToExplore, {});
-                        }
-                    });
+        if (is_debug_mode) {
+            std::cerr << "thread_num: " << thread_num << std::endl;
+            std::cerr << "partitioning_strategy: " << partitioning_strategy << std::endl;
         }
-        for (auto &t: threads)
-            t.join();
+        if (partitioning_strategy == PartStrategy::Normal || partitioning_strategy == PartStrategy::Rnd) {
+            std::vector<std::thread> threads;
+            threads.reserve(thread_num);
+            auto xs = std::vector<int>(itemsToExplore.size());
+            std::iota(xs.begin(), xs.end(), 0);
+            if (partitioning_strategy == PartStrategy::Rnd) {
+                std::shuffle(xs.begin(), xs.end(), std::mt19937(0));
+            }
+            const long part_size = (xs.size() - 1) / thread_num + 1;
+            if (is_debug_mode) {
+                std::cerr << "itemsToExplore size: " << itemsToExplore.size() << std::endl;
+                std::cerr << "partition size: " << part_size << std::endl;
+            }
+            int bg = 0;
+            for (int th = 0ul; th < int(thread_num); ++th) {
+                int ed = std::min<int>(bg + part_size, xs.size());
+                if (is_debug_mode) {
+                    std::cerr << "partition" << th << ": " << bg << " - " << ed << std::endl;
+                }
+                threads.emplace_back(
+                        [&, xs = std::vector(xs.begin() + bg, xs.begin() + ed)] {
+                            search(database, itemsToKeep, itemsToExplore, {}, xs);
+                        });
+                bg = ed;
+            }
+            for (auto &t: threads)
+                t.join();
+        } else if (partitioning_strategy == PartStrategy::Weighted) {
+            std::vector<std::thread> threads;
+            threads.reserve(thread_num);
+            auto xs = std::vector<int>(itemsToExplore.size());
+            std::iota(xs.begin(), xs.end(), 0);
+            long part_size = std::max<long>(2 * xs.size() / (thread_num * (thread_num + 1)), 1);
+            int ed = xs.size();
+            for (int th = 0; th < int(thread_num); ++th) {
+                int bg = std::max<int>(0, ed - part_size);
+                if (is_debug_mode) {
+                    std::cerr << "partition" << th << ": " << bg << " - " << ed << std::endl;
+                }
+                threads.emplace_back(
+                        [&, xs = std::vector(xs.begin() + bg, xs.begin() + ed)] {
+                            search(database, itemsToKeep, itemsToExplore, {}, xs);
+                        });
+                part_size = 2 * part_size;
+                ed = bg;
+            }
+            for (auto &t: threads)
+                t.join();
+        } else if (partitioning_strategy == PartStrategy::TwoLenPrefixPart) {
+            std::vector<SearchXRet> rets;
+            incCandidateCount(itemsToExplore.size());
+            for (int i = 0; i < int(itemsToExplore.size()); ++i) {
+                auto ret = searchXImpl(i, database, itemsToKeep, itemsToExplore, {});
+                incCandidateCount(ret.itemsToExplore.size());
+                for (int j = 0; j < int(ret.itemsToExplore.size()); ++j) {
+                    auto ret2 = searchXImpl(j, ret.projectedDB, ret.itemsToKeep, ret.itemsToExplore, ret.prefix);
+                    if (!ret2.itemsToExplore.empty()) {
+                        rets.push_back(std::move(ret2));
+                    }
+                }
+            }
+            map_sp([this](auto ret) {
+                search(ret.projectedDB, ret.itemsToKeep, ret.itemsToExplore, std::move(ret.prefix));
+            },
+                   std::move(rets));
+        }
     }
 
     time_point("Search");
+}
+
+auto EFIM::searchXImpl(int j, const std::vector<Transaction> &transactionsOfP,
+                       const Itemset &itemsToKeep, const Itemset &itemsToExplore, std::vector<Item> prefix)
+        -> EFIM::SearchXRet {
+    auto x = itemsToExplore.at(j);
+
+    std::vector<Transaction> transactionPx;
+    Utility utilityPx = 0;
+
+    Transaction previousTransaction{};
+    int consecutive_merge_count = 0;
+
+    for (auto &transaction: transactionsOfP) {
+        auto iterX = std::lower_bound(
+                transaction.begin(), transaction.end(), Transaction::Elem{x, 0},
+                [](const auto &l, const auto &r) { return l.first < r.first; });
+
+        // if the transaction contains 'x'
+        if (iterX == transaction.end() || iterX->first != x) {
+            continue;
+        }
+        if (iterX + 1 == transaction.end()) {
+            utilityPx += iterX->second + transaction.prefix_utility;
+        } else {
+            if (activateTransactionMerging && MAXIMUM_SIZE_MERGING >= std::distance(iterX, transaction.end())) {
+                auto projected = transaction.projection(iterX);
+                utilityPx += projected.prefix_utility;
+
+                if (!previousTransaction) {
+                    previousTransaction = std::move(projected);
+                } else if (projected.compare_extension(previousTransaction)) {
+                    if (consecutive_merge_count == 0) {
+                        if (pmem_alloc_type != PmemAllocType::None) {
+#ifdef DPHIM_PMEM
+                            auto pmem_allocator = get_pmem_allocator();
+                            previousTransaction = previousTransaction.clone(
+                                    [=](auto size) { return pmem_allocator->alloc(size); },
+                                    [=]([[maybe_unused]] auto size) {
+                                        return [=](auto *p) {
+                                            using T = std::remove_pointer_t<std::remove_cvref_t<decltype(p)>>;
+                                            p->~T();
+                                            pmem_allocator->dealloc(p);
+                                        };
+                                    });
+#endif
+                        } else {
+                            previousTransaction = previousTransaction.clone();
+                        }
+                    }
+                    previousTransaction.merge(std::move(projected));
+                    consecutive_merge_count++;
+                } else {
+                    transactionPx.push_back(std::move(previousTransaction));
+                    previousTransaction = std::move(projected);
+                    consecutive_merge_count = 0;
+                }
+            } else {
+                auto projected = transaction.projection(iterX);
+                utilityPx += projected.prefix_utility;
+                transactionPx.push_back(std::move(projected));
+            }
+        }
+    }
+
+    if (previousTransaction) {
+        transactionPx.push_back(std::move(previousTransaction));
+    }
+
+    decltype(auto) UB = calcUpperBounds(transactionPx, j, itemsToKeep);
+
+    std::vector<Item> newItemsToKeep, newItemsToExplore;
+    for (auto k = j + 1; k < int(itemsToKeep.size()); ++k) {
+        auto itemk = itemsToKeep[k];
+        if (UB.getSU(itemk) >= min_util) {
+            newItemsToKeep.push_back(itemk);
+            newItemsToExplore.push_back(itemk);
+        } else if (UB.getLU(itemk) >= min_util) {
+            newItemsToKeep.push_back(itemk);
+        }
+    }
+
+    prefix.push_back(newNameToOldNames[x]);
+
+    if (utilityPx >= min_util) {
+        writeOutput(prefix, utilityPx);
+    }
+
+    return SearchXRet{
+            .projectedDB = std::move(transactionPx),
+            .itemsToKeep = std::move(newItemsToKeep),
+            .itemsToExplore = std::move(newItemsToExplore),
+            .prefix = std::move(prefix),
+            .utility = utilityPx,
+    };
 }
 
 std::pair<Transaction, Item> EFIM::parseTransactionOneLine(std::string line) {
@@ -130,8 +296,9 @@ std::pair<Transaction, Item> EFIM::parseTransactionOneLine(std::string line) {
             }
         }
 
-        if ([[maybe_unused]] auto pmem_allocator = get_pmem_allocator()) {
+        if (pmem_alloc_type != PmemAllocType::None) {
 #ifdef DPHIM_PMEM
+            auto pmem_allocator = get_pmem_allocator();
             tra.reserve(
                     buf.size(),
                     [=](auto size) { return pmem_allocator->alloc(size); },
@@ -215,107 +382,9 @@ std::pair<std::vector<Transaction>, Item> EFIM::parseTransactions(const std::str
     return std::make_pair(std::move(res), maxItem);
 }
 
-void EFIM::searchX(int j, const std::vector<Transaction> &transactionsOfP, const Itemset &itemsToKeep, const Itemset &itemsToExplore, std::vector<Item> prefix) {
-    auto x = itemsToExplore[j];
 
-    std::vector<Transaction> transactionPx;
-    Utility utilityPx = 0;
-
-    Transaction previousTransaction{};
-    int consecutive_merge_count = 0;
-
-    for (auto &transaction: transactionsOfP) {
-        auto iterX = std::lower_bound(
-                transaction.begin(), transaction.end(), Transaction::Elem{x, 0},
-                [](const auto &l, const auto &r) { return l.first < r.first; });
-
-        // if the transaction contains 'x'
-        if (iterX == transaction.end() || iterX->first != x) {
-            continue;
-        }
-        if (iterX + 1 == transaction.end()) {
-            utilityPx += iterX->second + transaction.prefix_utility;
-        } else {
-            if (activateTransactionMerging && MAXIMUM_SIZE_MERGING >= std::distance(iterX, transaction.end())) {
-                auto projected = transaction.projection(iterX);
-                utilityPx += projected.prefix_utility;
-
-                if (!previousTransaction) {
-                    previousTransaction = std::move(projected);
-                } else if (projected.compare_extension(previousTransaction)) {
-                    if (consecutive_merge_count == 0) {
-
-                        if ([[maybe_unused]] auto pmem_allocator = get_pmem_allocator()) {
-#ifdef DPHIM_PMEM
-                            previousTransaction = previousTransaction.clone(
-                                    [=](auto size) { return pmem_allocator->alloc(size); },
-                                    [=]([[maybe_unused]] auto size) {
-                                        return [=](auto *p) {
-                                            using T = std::remove_pointer_t<std::remove_cvref_t<decltype(p)>>;
-                                            p->~T();
-                                            pmem_allocator->dealloc(p);
-                                        };
-                                    });
-#endif
-                        } else {
-                            previousTransaction = previousTransaction.clone();
-                        }
-                    }
-                    previousTransaction.merge(std::move(projected));
-                    consecutive_merge_count++;
-                } else {
-                    transactionPx.push_back(std::move(previousTransaction));
-                    previousTransaction = std::move(projected);
-                    consecutive_merge_count = 0;
-                }
-            } else {
-                auto projected = transaction.projection(iterX);
-                utilityPx += projected.prefix_utility;
-                transactionPx.push_back(std::move(projected));
-            }
-        }
-    }
-
-    if (previousTransaction) {
-        transactionPx.push_back(std::move(previousTransaction));
-    }
-
-    decltype(auto) UB = calcUpperBounds(transactionPx, j, itemsToKeep);
-
-    std::vector<Item> newItemsToKeep, newItemsToExplore;
-    for (auto k = j + 1; k < int(itemsToKeep.size()); ++k) {
-        auto itemk = itemsToKeep[k];
-        if (UB.getSU(itemk) >= min_util) {
-            newItemsToKeep.push_back(itemk);
-            newItemsToExplore.push_back(itemk);
-        } else if (UB.getLU(itemk) >= min_util) {
-            newItemsToKeep.push_back(itemk);
-        }
-    }
-
-    prefix.push_back(newNameToOldNames[x]);
-
-    if (utilityPx >= min_util) {
-        writeOutput(prefix, utilityPx);
-    }
-
-    if (activateSubtreeUtilityPruning) {
-        if (!newItemsToExplore.empty()) {
-            search(transactionPx, newItemsToKeep, newItemsToExplore, prefix);
-        }
-    } else {
-        search(transactionPx, newItemsToKeep, newItemsToKeep, prefix);
-    }
-}
-
-void EFIM::search(const std::vector<Transaction> &transactionsOfP, const Itemset &itemsToKeep, const Itemset &itemsToExplore, std::vector<Item> prefix) {
-    incCandidateCount(itemsToExplore.size());
-    for (int j = 0; j < int(itemsToExplore.size()); ++j) {
-        searchX(j, transactionsOfP, itemsToKeep, itemsToExplore, prefix);
-    }
-}
-
-std::pair<std::vector<Utility>, std::vector<Item>> EFIM::calcTWU(const Database &database, Item maxItem, Utility min_util) {
+template<typename I>
+std::pair<std::vector<Utility>, I> EFIM::calcTWU(const Database &database, Item maxItem, Utility min_util) {
     std::vector<Utility> itemTWU;
     itemTWU.resize(maxItem + 1, 0);
     for (auto &&transaction: database) {
@@ -353,7 +422,7 @@ std::vector<Utility> EFIM::calcFirstSU(const Database &database, std::size_t max
 const UtilityBinArray &
 EFIM::calcUpperBounds(const std::vector<Transaction> &transactionsPx, std::size_t j, const std::vector<Item> &itemsToKeep) {
     static thread_local UtilityBinArray utilityBinArray;
-    utilityBinArray.reset(itemsToKeep[j], itemsToKeep.back());
+    utilityBinArray.reset(itemsToKeep.at(j), itemsToKeep.back());
     for (auto &&transaction: transactionsPx) {
         Utility sum_remaining_utility = 0;
         auto ed = itemsToKeep.end();

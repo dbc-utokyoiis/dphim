@@ -5,10 +5,6 @@
 #include <ostream>
 #include <thread>
 
-#include <nova/util/atomic_intrusive_list.hpp>
-
-#include <iostream>
-
 namespace nova {
 inline namespace scheduler {
 
@@ -20,7 +16,7 @@ struct task_base {
     task_base &operator=(task_base &&) = delete;
     virtual ~task_base() = default;
     virtual void execute() = 0;
-    task_base *next = nullptr;
+    virtual bool ready() const { return true; }
 };
 
 enum class WorkerState {
@@ -37,6 +33,8 @@ inline std::ostream &operator<<(std::ostream &os, WorkerState s) {
             return os << "S";
         case WorkerState::Notified:
             return os << "N";
+        default:
+            return os << "?";
     }
 }
 
@@ -54,11 +52,11 @@ struct worker_base {
             throw std::runtime_error{"already run_worker worker on this thread."};
         }
         this_thread_worker_id = this->id;
-        state.store(WorkerState::Running, std::memory_order_release);
+        state.store(WorkerState::Running);
         while (true) {
             while (static_cast<Derived *>(this)->execute_one()) {}
             static_cast<Derived *>(this)->try_sleep();
-            if (is_stop_requested.load(std::memory_order_acquire)) {
+            if (is_stop_requested.load()) {
                 this_thread_worker_id = std::nullopt;
                 return;
             }
@@ -66,7 +64,6 @@ struct worker_base {
         this_thread_worker_id = std::nullopt;
     }
 
-public:
     struct nop {
         void operator()(auto &&) {}
     };
@@ -74,7 +71,7 @@ public:
     template<typename F = nop>
     bool try_wake_up(F &&before_notify = {}) {
         auto e = WorkerState::Sleeping;
-        if (state.compare_exchange_strong(e, WorkerState::Notified, std::memory_order_release, std::memory_order_relaxed)) {
+        if (state.compare_exchange_strong(e, WorkerState::Notified, MEM_ORDER_REL, MEM_ORDER_RELAXED)) {
             before_notify(*static_cast<Derived *>(this));
             state.notify_all();
             return true;
@@ -83,27 +80,36 @@ public:
         }
     }
 
-    void stop_request() {
-        is_stop_requested.store(true, std::memory_order_release);
-        state.store(WorkerState::Notified, std::memory_order_release);
+    void force_wake_up() {
+        state.store(WorkerState::Notified);
         state.notify_all();
+    }
+
+    // bool is_running() const {
+    //     return state.load(MEM_ORDER_ACQ) == WorkerState::Running;
+    // }
+
+    void stop_request() {
+        is_stop_requested.store(true, MEM_ORDER_REL);
+        force_wake_up();
     }
 
 protected:
     void try_sleep(WorkerState e = WorkerState::Running) {
-        while (state.compare_exchange_strong(e, WorkerState::Sleeping, std::memory_order_release, std::memory_order_relaxed)) {
-            for (int i = 0; i < 50; ++i) {
+        if (this_thread_worker_id.value() != id) {
+            throw std::runtime_error{"this_thread_worker_id != id"};
+        }
+        if (state.compare_exchange_strong(e, WorkerState::Sleeping)) {
+            for (int i = 0; i < 100; ++i) {
                 if (static_cast<Derived *>(this)->execute_one()) {
-                    state.store(WorkerState::Running, std::memory_order_release);
+                    state.store(WorkerState::Running);
                     return;
                 }
                 std::this_thread::yield();
             }
-            state.wait(WorkerState::Sleeping, std::memory_order_acquire);
-            e = WorkerState::Sleeping;
+            state.wait(WorkerState::Sleeping);// sleep if state is still WorkerState::Sleeping
         }
-        e = WorkerState::Notified;
-        state.compare_exchange_strong(e, WorkerState::Running, std::memory_order_release, std::memory_order_relaxed);
+        state.store(WorkerState::Running);
     }
 
     const id_t id;

@@ -3,9 +3,12 @@
 #include <nova/config.hpp>
 #include <nova/worker.hpp>
 
+#include <functional>
 #include <iostream>
 #include <thread>
 #include <vector>
+
+#include <papi.h>
 
 namespace nova {
 inline namespace scheduler {
@@ -18,34 +21,56 @@ struct scheduler_base {
     explicit scheduler_base(std::size_t thread_num)
         : thread_num(thread_num), thread_pool(thread_num) {}
 
+    scheduler_base(const scheduler_base &) = delete;
+    scheduler_base(scheduler_base &&) noexcept = delete;
+
     virtual ~scheduler_base() = default;
 
     struct [[nodiscard]] operation : nova::task_base {
 
         explicit operation(nova::scheduler_base *sched, int option)
-            : sched(sched), coro{}, option(option) {}
+            : sched(sched), coro{nullptr}, option(option) {}
+
+        operation(const operation &) = delete;
+        operation(operation &&other) noexcept
+            : sched(other.sched),
+              coro(std::exchange(other.coro, {})),
+              option(other.option) {}
+
         ~operation() override = default;
+
+        operation operator()() const & {
+            return operation(sched, option);
+        }
+
         auto await_ready() const noexcept { return option == OPTION_NO_AWAIT; }
-        void await_suspend(nova::coro::coroutine_handle<> h) noexcept {
+        void await_suspend(nova::coro::coroutine_handle<> h) {
             coro = h;
             sched->post(this, option);
         }
         void await_resume() const noexcept {}
-        void execute() override { coro.resume(); }
+        void execute() override {
+            coro.resume();
+        }
+        bool ready() const override {
+            return bool(coro) && !coro.done();
+        }
 
     private:
-        nova::scheduler_base *sched;
+        nova::scheduler_base *const sched;
         nova::coro::coroutine_handle<> coro;
-        int option = OPTION_DEFAULT;
+        const int option = OPTION_DEFAULT;
     };
 
-    auto schedule(int option = OPTION_DEFAULT) -> operation {
-        return operation{this, option};
+    auto schedule(int option = OPTION_DEFAULT) & -> operation {
+        return operation(this, option);
     }
 
-    void start() {
+    void start(std::function<void()> callback = nullptr) {
         for (auto i = 0; i < int(thread_pool.size()); ++i) {
-            thread_pool.at(i) = std::thread{[this, i] {
+            thread_pool.at(i) = std::thread{[this, i, callback] {
+                if (callback)
+                    callback();
                 this->run_worker(i);
             }};
         }
@@ -61,9 +86,10 @@ struct scheduler_base {
 
     virtual void post(task_base *task, int option) = 0;
 
-    virtual std::optional<int> get_current_cpu_id() const { return std::nullopt; }
-    virtual std::optional<int> get_current_node_id() const { return std::nullopt; }
-    virtual std::optional<int> get_max_node_id() const { return std::nullopt; }
+    [[nodiscard]] virtual std::optional<int> get_current_cpu_id() const { return std::nullopt; }
+    [[nodiscard]] virtual std::optional<int> get_current_node_id() const { return std::nullopt; }
+    [[nodiscard]] virtual std::optional<int> get_max_node_id() const { return std::nullopt; }
+    [[nodiscard]] virtual std::optional<int> get_corresponding_cpu_id(int /*node*/) const { return std::nullopt; }
 
 protected:
     virtual void run_worker(int cpu) = 0;

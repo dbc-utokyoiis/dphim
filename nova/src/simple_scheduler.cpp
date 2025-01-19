@@ -1,5 +1,7 @@
 #include <nova/simple_scheduler.hpp>
 
+#include <algorithm>
+#include <nova/util/concurrent_list.hpp>
 #include <random>
 #include <thread>
 
@@ -25,13 +27,15 @@ private:
             throw std::runtime_error("simple_worker is executed on an unlinked thread.");
         }
 
-        if (auto op = task_queue.pop_front()) {
-            op->execute();
+        if (task_queue.consume_once([](auto *op) {
+                op->execute();
+            }) > 0) {
             return true;
         }
 
-        if (auto op = sched->try_steal(this->id)) {
-            op->execute();
+        if (sched->try_steal(this->id, [](auto *op) {
+                op->execute();
+            })) {
             return true;
         }
 
@@ -39,26 +43,24 @@ private:
     }
 
     simple_scheduler *sched;
-    atomic_intrusive_list<task_base, &task_base::next> task_queue;
+    concurrent_stack<task_base *> task_queue;
 };
 
-task_base *simple_scheduler::try_steal(worker_t::id_t stealer) {
-    if (auto *op = global_task_queue.pop_front()) {
-        return op;
+bool simple_scheduler::try_steal(worker_t::id_t stealer, void (*func)(task_base *)) {
+    if (global_task_queue.consume_once(func) > 0) {
+        return true;
     }
 
     thread_local std::random_device seed_gen;
-
     auto worker_list = workers;
     std::shuffle(worker_list.begin(), worker_list.end(), std::mt19937(seed_gen()));
 
     for (auto &w: worker_list) {
-        task_base *op;
-        if (w && w->id != stealer && (op = w->task_queue.pop_front())) {
-            return op;
+        if (w && w->id != stealer && w->task_queue.consume_once(func) > 0) {
+            return true;
         }
     }
-    return nullptr;
+    return false;
 }
 
 void simple_scheduler::delegate(task_base *op, std::optional<worker_t::id_t> source_worker) {
@@ -92,8 +94,9 @@ void simple_scheduler::run_worker(int wid) {
 
 void simple_scheduler::stop_request() {
     for (auto &w: workers) {
-        if (w)
+        if (w) {
             w->stop_request();
+        }
     }
 }
 

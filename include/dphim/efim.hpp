@@ -1,6 +1,7 @@
 #pragma once
 
 #include <optional>
+#include <thread>
 
 #include <dphim/logger.hpp>
 #include <dphim/parse.hpp>
@@ -10,58 +11,173 @@
 
 namespace dphim {
 
-struct EFIM : ConcurrentLogger {
-    using Database = std::vector<Transaction>;
-    using Itemset = std::vector<Item>;
+enum class PmemAllocType { None,
+                           AEK,
+                           Elems,
+};
 
-    EFIM(const std::string &input_path, const std::string &output_path, Utility minutil, [[maybe_unused]] int th_num)
+enum class PartStrategy {
+    Normal,
+    Rnd,
+    Weighted,
+    TwoLenPrefixPart,
+};
+
+inline std::ostream &operator<<(std::ostream &os, const PartStrategy &strategy) {
+    switch (strategy) {
+        case PartStrategy::Normal:
+            os << "Normal";
+            break;
+        case PartStrategy::Rnd:
+            os << "Rnd";
+            break;
+        case PartStrategy::Weighted:
+            os << "Weighted";
+            break;
+        case PartStrategy::TwoLenPrefixPart:
+            os << "TwoLenPrefixPart";
+            break;
+    }
+    return os;
+}
+
+
+struct EFIM : ConcurrentLogger, pmem_allocate_trait {
+    using Itemset = std::vector<Item>;
+    using Database = std::vector<Transaction>;
+
+private:
+    std::vector<Utility> utilityBinArraySU, utilityBinArrayLU;
+    std::vector<Item> oldNameToNewNames, newNameToOldNames;
+
+    std::string input_path;
+    Utility min_util;
+    Item maxItem;
+    PartStrategy partitioning_strategy;
+    PmemAllocType pmem_alloc_type = PmemAllocType::None;
+
+public:
+    explicit EFIM(const std::string &input_path, const std::string &output_path, Utility minutil, [[maybe_unused]] int th_num)
         : ConcurrentLogger(output_path, minutil, th_num), input_path(input_path), min_util(minutil) {}
+
+    void set_partition_strategy(const std::string &strategy) {
+        if (strategy == "rnd") {
+            partitioning_strategy = PartStrategy::Rnd;
+        } else if (strategy == "weighted") {
+            partitioning_strategy = PartStrategy::Weighted;
+        } else if (strategy == "twolen") {
+            partitioning_strategy = PartStrategy::TwoLenPrefixPart;
+        } else {
+            partitioning_strategy = PartStrategy::Normal;
+        }
+        if (is_debug_mode) {
+            std::cerr << "Current partitioning strategy: ";
+            switch (partitioning_strategy) {
+                case PartStrategy::Normal:
+                    std::cerr << "Normal" << std::endl;
+                    break;
+                case PartStrategy::Rnd:
+                    std::cerr << "Rnd" << std::endl;
+                    break;
+                case PartStrategy::Weighted:
+                    std::cerr << "Weighted" << std::endl;
+                    break;
+                case PartStrategy::TwoLenPrefixPart:
+                    std::cerr << "TwoLenPrefixPart" << std::endl;
+                    break;
+            }
+        }
+    }
+
+    void set_debug_mode(bool flag) {
+        is_debug_mode = flag;
+    }
 
     void run();
 
+    template<typename I>
+    void run_impl();
+
     std::pair<Transaction, Item> parseTransactionOneLine(std::string line);
-    std::pair<std::vector<Transaction>, Item> parseTransactions(const std::string &input_path);
+    std::pair<Database, Item> parseTransactions(const std::string &input_path);
 
-    void searchX(int j, const std::vector<Transaction> &transactionsOfP, const Itemset &itemsToKeep, const Itemset &itemsToExplore, std::vector<Item> prefix);
-    void search(const std::vector<Transaction> &transactionsOfP, const Itemset &itemsToKeep, const Itemset &itemsToExplore, std::vector<Item> prefix);
-    const UtilityBinArray &calcUpperBounds(const std::vector<Transaction> &transactionsPx, std::size_t j, const std::vector<Item> &itemsToKeep);
+    struct SearchXRet {
+        Database projectedDB;
+        Itemset itemsToKeep;
+        Itemset itemsToExplore;
+        std::vector<Item> prefix;
+        Utility utility;
+    };
 
-    static std::pair<std::vector<Utility>, std::vector<Item>> calcTWU(const Database &database, Item maxItem, Utility min_util);
-    static std::vector<Utility> calcFirstSU(const Database &database, std::size_t maxItem);
+    auto searchXImpl(int j, const Database &transactionsOfP,
+                     const Itemset &itemsToKeep, const Itemset &itemsToExplore, std::vector<Item> prefix)
+            -> SearchXRet;
 
-    auto get_pmem_allocator([[maybe_unused]] std::optional<int> node = std::nullopt) {
-#ifdef DPHIM_PMEM
-        if (pmem_allocators.size() == 1) {
-            return pmem_allocators.front();
-        } else if (!pmem_allocators.empty()) {
-            if (node) {
-                return pmem_allocators.at(*node);
-            } else {
-                thread_local auto [cpu, node] = [] {
-                    unsigned int cpu, node;
-                    getcpu(&cpu, &node);
-                    return std::make_pair(cpu, node);
-                }();
-                return pmem_allocators.at(node);
+    void searchX(int j, const Database &transactionsOfP,
+                 const Itemset &itemsToKeep, const Itemset &itemsToExplore, std::vector<Item> prefix) {
+        auto ret = searchXImpl(j, transactionsOfP, itemsToKeep, itemsToExplore, std::move(prefix));
+        if (activateSubtreeUtilityPruning) {
+            if (!ret.itemsToExplore.empty()) {
+                search(ret.projectedDB,
+                       ret.itemsToKeep,
+                       ret.itemsToExplore,
+                       std::move(ret.prefix));
             }
+        } else {
+            search(ret.projectedDB,
+                   ret.itemsToKeep,
+                   ret.itemsToExplore,
+                   std::move(ret.prefix));
         }
-        return std::shared_ptr<dphim::pmem_allocator>();
-#else
-        return nullptr;
-#endif
-        //        throw std::runtime_error("pmem is unsupported");
     }
 
-    template<typename F, typename T>
-    auto map_sp(F &&func, const std::vector<T> &args) -> std::vector<std::invoke_result_t<F, const T &>> {
-        using R = std::invoke_result_t<F, T>;
+    void search(const Database &transactionsOfP,
+                const Itemset &itemsToKeep, const Itemset &itemsToExplore, std::vector<Item> prefix) {
+        incCandidateCount(itemsToExplore.size());
+        for (int j = 0; j < int(itemsToExplore.size()); ++j) {
+            searchX(j, transactionsOfP, itemsToKeep, itemsToExplore, prefix);
+        }
+    }
+
+    void search(const Database &transactionsOfP,
+                const Itemset &itemsToKeep, const Itemset &itemsToExplore, std::vector<Item> prefix,
+                std::vector<int> xs) {
+        incCandidateCount(xs.size());
+        for (auto j: xs) {
+            searchX(j, transactionsOfP, itemsToKeep, itemsToExplore, prefix);
+        }
+    }
+
+    // void search(const Database &transactionsOfP,
+    //             const Itemset &itemsToKeep, const Itemset &itemsToExplore, std::vector<Item> prefix,
+    //             std::pair<int, int> range) {
+    //     if (range.first > range.second) {
+    //         throw std::runtime_error("hoge");
+    //     }
+    //     std::cout << range.second - range.first << std::endl;
+    //     incCandidateCount(range.second - range.first);
+    //     for (int j = range.first; j < range.second; ++j) {
+    //         searchX(j, transactionsOfP, itemsToKeep, itemsToExplore, prefix);
+    //     }
+    // }
+
+    const UtilityBinArray &calcUpperBounds(const Database &transactionsPx, std::size_t j, const std::vector<Item> &itemsToKeep);
+
+    template<typename I = std::vector<Item>>
+    static std::pair<std::vector<Utility>, I> calcTWU(const Database &database, Item maxItem, Utility min_util);
+
+    static std::vector<Utility> calcFirstSU(const Database &database, std::size_t maxItem);
+
+    template<typename F, typename T, typename R = std::invoke_result_t<F, T>>
+    auto map_sp(F &&func, const std::vector<T> &args) -> std::enable_if_t<!std::is_same_v<R, void>, std::vector<R>> {
         std::vector<std::thread> threads;
         std::vector<R> ret(args.size());
         auto diff = (args.size() - 1) / thread_num + 1;
         for (auto i = 0ul; i < thread_num; ++i) {
             threads.emplace_back([&ret, &args, &func](auto bg, auto ed) {
-                for (auto idx = bg; idx < ed; ++idx)
+                for (auto idx = bg; idx < ed; ++idx) {
                     ret[idx] = func(args[idx]);
+                }
             },
                                  i * diff, std::min<int>((i + 1) * diff, args.size()));
         }
@@ -71,23 +187,57 @@ struct EFIM : ConcurrentLogger {
         return ret;
     }
 
-    template<typename F, typename T>
-    auto map_sp(F &&func, std::vector<T> &&args) -> std::vector<std::invoke_result_t<F, T &&>> {
-        using R = std::invoke_result_t<F, T>;
+    template<typename F, typename T, typename R = std::invoke_result_t<F, T>>
+    auto map_sp(F &&func, std::vector<T> &&args) -> std::enable_if_t<!std::is_same_v<R, void>, std::vector<R>> {
         std::vector<std::thread> threads;
         std::vector<R> ret(args.size());
-        std::ptrdiff_t diff = (args.size() - 1) / thread_num + 1;
-        for (std::ptrdiff_t i = 0; i < std::ptrdiff_t(thread_num); ++i) {
+        auto diff = (args.size() - 1) / thread_num + 1;
+        for (auto i = 0ul; i < thread_num; ++i) {
             threads.emplace_back([&ret, &args, &func](auto bg, auto ed) {
-                for (auto idx = bg; idx < ed; ++idx)
+                for (auto idx = bg; idx < ed; ++idx) {
                     ret[idx] = func(std::move(args[idx]));
+                }
             },
-                                 i * diff, std::min<std::ptrdiff_t>((i + 1) * diff, args.size()));
+                                 i * diff, std::min<unsigned long>((i + 1) * diff, args.size()));
         }
         for (auto &th: threads)
             if (th.joinable())
                 th.join();
         return ret;
+    }
+
+    template<typename F, typename T, typename R = std::invoke_result_t<F, T>>
+    auto map_sp(F &&func, const std::vector<T> &args) -> std::enable_if_t<std::is_same_v<R, void>, void> {
+        std::vector<std::thread> threads;
+        auto diff = (args.size() - 1) / thread_num + 1;
+        for (auto i = 0ul; i < thread_num; ++i) {
+            threads.emplace_back([&args, &func](auto bg, auto ed) {
+                for (auto idx = bg; idx < ed; ++idx) {
+                    func(args[idx]);
+                }
+            },
+                                 i * diff, std::min<unsigned long>((i + 1) * diff, args.size()));
+        }
+        for (auto &th: threads)
+            if (th.joinable())
+                th.join();
+    }
+
+    template<typename F, typename T, typename R = std::invoke_result_t<F, T>>
+    auto map_sp(F &&func, std::vector<T> &&args) -> std::enable_if_t<std::is_same_v<R, void>, void> {
+        std::vector<std::thread> threads;
+        auto diff = (args.size() - 1) / thread_num + 1;
+        for (auto i = 0ul; i < thread_num; ++i) {
+            threads.emplace_back([&args, &func](auto bg, auto ed) {
+                for (auto idx = bg; idx < ed; ++idx) {
+                    func(std::move(args[idx]));
+                }
+            },
+                                 i * diff, std::min<unsigned long>((i + 1) * diff, args.size()));
+        }
+        for (auto &th: threads)
+            if (th.joinable())
+                th.join();
     }
 
     template<typename F, typename T>
@@ -106,36 +256,12 @@ struct EFIM : ConcurrentLogger {
         return ret;
     }
 
-private:
-    std::vector<Utility> utilityBinArraySU, utilityBinArrayLU;
-    std::vector<Item> oldNameToNewNames, newNameToOldNames;
-
-#ifdef DPHIM_PMEM
-    std::vector<std::shared_ptr<pmem_allocator>> pmem_allocators;
-#endif
-
-    std::string input_path;
-    Utility min_util;
-    Item maxItem;
-
 public:
     bool activateTransactionMerging = true;
     bool activateSubtreeUtilityPruning = true;
     long MAXIMUM_SIZE_MERGING = 1000;
     bool use_parallel_sort = true;
-
-    void set_pmem_path([[maybe_unused]] std::vector<std::string> paths) {
-#ifdef DPHIM_PMEM
-        try {
-            pmem_allocators.resize(paths.size());
-            for (auto i = 0ul; i < pmem_allocators.size(); ++i) {
-                pmem_allocators[i] = std::make_shared<pmem_allocator>(paths[i].c_str());
-            }
-        } catch (std::exception &e) {
-            std::cerr << e.what() << std::endl;
-        }
-#endif
-    }
 };
+
 
 }// namespace dphim

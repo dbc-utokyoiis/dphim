@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <cstdint>
 #include <memory>
 #include <numeric>
 #include <ostream>
@@ -107,6 +108,11 @@ public:
 
 #else
 
+struct DefaultDeleterFactory {
+    auto operator()(std::size_t) const noexcept {
+        return [](void *p) noexcept { std::free(p); };
+    }
+};
 struct Transaction {
     using Elem = std::pair<Item, Utility>;
     Transaction() = default;
@@ -116,8 +122,37 @@ private:
     Transaction &operator=(const Transaction &) = default;
 
 public:
-    Transaction(Transaction &&) noexcept = default;
-    Transaction &operator=(Transaction &&) noexcept = default;
+    Transaction(Transaction &&other) noexcept
+        : elems(std::move(other.elems)),
+          elems_size(other.elems_size),
+          reserved_size(other.reserved_size),
+          offset(other.offset),
+          transaction_utility(other.transaction_utility),
+          prefix_utility(other.prefix_utility) {
+        other.elems = nullptr;
+        other.elems_size = 0;
+        other.reserved_size = 0;
+        other.offset = 0;
+        other.transaction_utility = 0;
+        other.prefix_utility = 0;
+    }
+    Transaction &operator=(Transaction &&other) noexcept {
+        if (this != &other) {
+            elems = std::move(other.elems);
+            elems_size = other.elems_size;
+            reserved_size = other.reserved_size;
+            offset = other.offset;
+            transaction_utility = other.transaction_utility;
+            prefix_utility = other.prefix_utility;
+            other.elems = nullptr;
+            other.elems_size = 0;
+            other.reserved_size = 0;
+            other.offset = 0;
+            other.transaction_utility = 0;
+            other.prefix_utility = 0;
+        }
+        return *this;
+    }
 
     explicit operator bool() const noexcept {
         return bool(elems);
@@ -171,13 +206,13 @@ public:
         elems[elems_size++] = v;
     }
 
-    bool compare_extension(const Transaction &other) const {
+    [[nodiscard]] bool compare_extension(const Transaction &other) const {
         return std::equal(begin(), end(), other.begin(), other.end(), [](const Elem &l, const Elem &r) { return l.first == r.first; });
     }
 
     template<typename Iter>
-    Transaction projection(Iter iter) const {
-        auto ret = *this;// ほとんどの時間がここ
+    [[nodiscard]] Transaction projection(Iter iter) const {
+        auto ret = *this;
         auto utilityE = iter->second;
         ret.prefix_utility += utilityE;
         ret.transaction_utility -= utilityE;
@@ -188,22 +223,22 @@ public:
         return ret;
     }
 
-    Transaction clone() const {
+    [[nodiscard]] Transaction clone() const {
         std::shared_ptr<Elem[]> elems(new Elem[size()]);
         std::copy(begin(), end(), elems.get());
         return Transaction{std::move(elems), size(), size(), 0, transaction_utility, prefix_utility};
     }
 
-    template<typename A, typename D>
-    Transaction
-    clone(A &&alloc_func, D &&deleter_factory) const {
+    template<typename A, typename D = DefaultDeleterFactory>
+    [[nodiscard]] Transaction
+    clone(A &&alloc_func, D &&deleter_factory = {}) const {
         auto *p = reinterpret_cast<Elem *>(alloc_func(sizeof(Elem) * size()));
         std::shared_ptr<Elem[]> elems(p, deleter_factory(sizeof(Elem) * size()));
         std::copy(begin(), end(), elems.get());
         return Transaction{std::move(elems), size(), size(), 0, transaction_utility, prefix_utility};
     }
 
-    void merge(Transaction &&other) {
+    void merge(const Transaction &other) {
         auto iter1 = begin(), iter2 = other.begin();
         for (; iter1 != end(); ++iter1, ++iter2) {
             iter1->second += iter2->second;
@@ -234,9 +269,9 @@ private:
     std::shared_ptr<Elem[]> elems;
     std::size_t elems_size = 0;
     std::size_t reserved_size = 0;
-    std::ptrdiff_t offset = 0;
 
 public:
+    std::ptrdiff_t offset = 0;
     Utility transaction_utility = 0;
     Utility prefix_utility = 0;
 };

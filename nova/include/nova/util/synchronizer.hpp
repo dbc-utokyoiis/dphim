@@ -3,6 +3,8 @@
 #include <condition_variable>
 #include <mutex>
 
+#include <nova/config.hpp>
+
 namespace nova {
 
 template<typename TState = bool>
@@ -73,12 +75,12 @@ struct futex_synchronizer {
     }
 
     void notify() {
-        flag.test_and_set(std::memory_order_release);
+        flag.test_and_set(MEM_ORDER_REL);
         flag.notify_one();
     }
 
     void notify_all() {
-        flag.test_and_set(std::memory_order_release);
+        flag.test_and_set(MEM_ORDER_REL);
         flag.notify_all();
     }
 

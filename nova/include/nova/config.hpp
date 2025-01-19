@@ -1,6 +1,6 @@
 #pragma once
 
-#if __has_include(<coroutine>)
+#if __has_include(<coroutine> )
 #include <coroutine>
 namespace nova {
 namespace coro = std;
@@ -42,8 +42,10 @@ struct coroutine_base {
 
     ~coroutine_base() {
         if (coro) {
-            if (!coro.done())
-                std::cout << "!coro.done()" << std::endl;
+            if (!coro.done()) {
+                std::cerr << "WARNING: destruct unfinished coroutine" << std::endl;
+                // std::abort();
+            }
             coro.destroy();
         }
     }
@@ -51,8 +53,8 @@ struct coroutine_base {
     promise_type &get_promise() { return coro.promise(); }
     const promise_type &get_promise() const { return coro.promise(); }
 
-    bool done() const { return coro.done(); }
-    bool valid() const { return bool(coro); }
+    [[nodiscard]] bool done() const { return coro.done(); }
+    [[nodiscard]] bool valid() const { return bool(coro); }
 
 protected:
     explicit coroutine_base(coro::coroutine_handle<promise_type> coro)
@@ -60,5 +62,17 @@ protected:
 
     coro::coroutine_handle<promise_type> coro;
 };
+
+#if 1
+#define MEM_ORDER_RELAXED std::memory_order_relaxed
+#define MEM_ORDER_REL std::memory_order_release
+#define MEM_ORDER_ACQ std::memory_order_acquire
+#define MEM_ORDER_ACQ_REL std::memory_order_acq_rel
+#else
+#define MEM_ORDER_RELAXED std::memory_order_seq_cst
+#define MEM_ORDER_REL std::memory_order_seq_cst
+#define MEM_ORDER_ACQ std::memory_order_seq_cst
+#define MEM_ORDER_ACQ_REL std::memory_order_seq_cst
+#endif
 
 }// namespace nova

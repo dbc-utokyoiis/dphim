@@ -2,7 +2,7 @@
 
 #include <nova/config.hpp>
 #include <nova/scheduler_base.hpp>
-#include <nova/util/atomic_intrusive_list.hpp>
+#include <nova/util/parallel_intrusive_list.hpp>
 #include <nova/worker.hpp>
 
 #include <atomic>

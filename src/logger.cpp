@@ -30,7 +30,7 @@ void Logger::flushOutput() {
 }
 
 void Logger::time_point(const std::string &name) {
-    std::cout << "time point: " << name << std::endl;
+    // std::cout << "time point: " << name << std::endl;
     timer.point(name);
 }
 
@@ -42,14 +42,16 @@ void Logger::print(std::ostream &out) {
     out << "Candidate count: " << candidate_count << "\n";
     out << "# of threads: " << thread_num << "\n";
     out << "Total time ~: " << duration_cast<milliseconds>(timer.totalTime()).count() << " ms\n";
-    //    out << "=========== STATISITCS =============\n";
-    //    timer.print(out);
+    out << "=========== STATISITCS =============\n";
+    timer.print(out);
     out << "====================================" << std::endl;
 }
 
-ConcurrentLogger::ConcurrentLogger(const std::string &output_path, Utility min_util, std::size_t thread_num)
+ConcurrentLogger::ConcurrentLogger(const std::string &output_path, Utility min_util, std::size_t thread_num, bool is_debug)
     : min_util(min_util), thread_num(thread_num),
-      results(thread_num), output_is_null(output_path == "/dev/null") {
+      output_is_null(output_path == "/dev/null"),
+      is_debug(is_debug),
+      results(thread_num) {
     std::filesystem::path path{output_path};
     auto dir = path;
     dir.remove_filename();
@@ -75,7 +77,9 @@ void ConcurrentLogger::flushOutput() {
 
 
 void ConcurrentLogger::time_point(const std::string &name) {
-    std::cout << "time point: " << name << std::endl;
+    if (is_debug) {
+        std::cerr << "time point: " << name << std::endl;
+    }
     timer.point(name);
 }
 
@@ -91,9 +95,34 @@ void ConcurrentLogger::print(std::ostream &out) {
     out << "Total time ~: " << tot_time << " ms\n";
     out << "CPU time ~: " << cpu_time << " ms\n";
     out << "CPU Usage ~: " << 1.0 * cpu_time / tot_time << " \n";
+    if (is_debug) {
+        out << "Step3 Internal Malloc: " << malloc_log.get() / 1000 << "kB\n";
+        out << "                  Avg: " << malloc_log.get() / malloc_count.get() << "B\n";
+    }
     out << "=========== STATISITCS =============\n";
-    timer.print(out);
+    timer.print(out, false);
     out << "====================================" << std::endl;
+}
+
+void ConcurrentLogger::print_json(std::ostream &out) {
+    using namespace std::chrono;
+    auto tot_time = duration_cast<milliseconds>(timer.totalTime()).count();
+    auto cpu_time = duration_cast<milliseconds>(timer.totalCpuTime()).count();
+    auto indent = "  ";
+    ;
+    out << "{\n";
+    out << "\"result\": {\n"
+        << indent << "\"minUtil\": " << min_util << ",\n"
+        << indent << "\"hui_count\": " << hui_count.get() << ",\n"
+        << indent << "\"candidate_count\": " << candidate_count.get() << ",\n"
+        << indent << "\"thread_num\": " << thread_num << ",\n"
+        << indent << "\"total_time\": " << tot_time << ",\n"
+        << indent << "\"cpu_time\": " << cpu_time << ",\n"
+        << indent << "\"cpu_usage\": " << 1.0 * cpu_time / tot_time << "\n"
+        << "},\n";
+    out << "\"statistics\": ";
+    timer.print(out, true);
+    out << "}\n";
 }
 
 }// namespace dphim

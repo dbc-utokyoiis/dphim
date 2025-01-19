@@ -1,13 +1,12 @@
-
 #include <dphim/dphim_base.hpp>
 #include <dphim/util/pmem_allocator.hpp>
+#include <nova/jemalloc.hpp>
 #include <nova/when_all.hpp>
 
 #include <cerrno>
 #include <cstddef>
 #include <cstring>
 #include <fcntl.h>
-#include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -16,7 +15,7 @@
 
 namespace dphim {
 
-std::pair<Transaction, Item> dphim_base::parseOneLine(std::string line, [[maybe_unused]] int node) {
+std::pair<Transaction, Item> DphimBase::parseOneLine(std::string line, [[maybe_unused]] int node) {
     Transaction tra;
     Item max_item = 0;
 
@@ -84,21 +83,25 @@ std::pair<Transaction, Item> dphim_base::parseOneLine(std::string line, [[maybe_
     return std::make_pair(std::move(tra), max_item);
 }
 
-auto dphim_base::parseTransactions() -> nova::task<std::pair<Database, Item>> {
+auto DphimBase::parseTransactions(std::function<std::size_t(std::size_t)> get_partition_num) -> nova::task<std::pair<Database, Item>> {
     struct stat st;
     if (stat(input_path.c_str(), &st) == -1)
         throw std::runtime_error(strerror(errno));
 
-    std::vector<nova::task<std::pair<Transactions, Item>>> tasks;
-    auto max_node = sched->get_max_node_id().value_or(0);
-    tasks.reserve(max_node + 1);
     auto fsize = st.st_size;
-    auto diff = (fsize - 1) / (max_node + 1) + 1;
-    for (int i = 0; i < max_node + 1; ++i) {
-        auto bg = diff * i;
-        auto ed = std::min(diff * (i + 1), fsize + 1);
+    auto partition_num = get_partition_num ? get_partition_num(fsize) : 1;
+
+    std::vector<nova::task<std::pair<Transactions, Item>>> tasks;
+    tasks.reserve(partition_num);
+    auto diff = (fsize - 1) / partition_num + 1;
+    for (auto i = 0ul; i < partition_num; ++i) {
+        off_t bg = diff * i;
+        off_t ed = std::min<off_t>(diff * (i + 1), fsize + 1);
         tasks.emplace_back(parseFileRange(input_path.c_str(), bg, ed, i));
     }
+
+    if (is_debug_mode())
+        std::cerr << "# of parseFileRange tasks: " << tasks.size() << std::endl;
 
     Database db(tasks.size());
     Item maxItem = 0;
@@ -110,7 +113,7 @@ auto dphim_base::parseTransactions() -> nova::task<std::pair<Database, Item>> {
     co_return std::pair<Database, Item>{std::move(db), maxItem};
 }
 
-auto dphim_base::parseFileRange(const char *pathname, off_t bg, off_t ed, int node) -> nova::task<std::pair<Transactions, Item>> {
+auto DphimBase::parseFileRange(const char *pathname, off_t bg, off_t ed, int node) -> nova::task<std::pair<Transactions, Item>> {
 
     co_await schedule();
 
@@ -120,7 +123,7 @@ auto dphim_base::parseFileRange(const char *pathname, off_t bg, off_t ed, int no
     }
 
     auto parse_task = [](auto self, auto node, std::vector<std::string> lines) -> nova::task<std::pair<Transactions, Item>> {
-        co_await self->schedule(node);
+        co_await self->schedule();
         Transactions transactions;
         try {
             transactions.reserve(lines.size());
@@ -148,6 +151,7 @@ auto dphim_base::parseFileRange(const char *pathname, off_t bg, off_t ed, int no
 
     auto launch_type = nova::launch::immediate;
     auto when_all_parse = nova::when_all(std::vector<nova::task<std::pair<Transactions, Item>>>{});
+    std::size_t parse_task_num = 0;
     std::size_t transaction_num = 0;
 
     constexpr std::size_t buf_size = 4092;
@@ -186,6 +190,7 @@ auto dphim_base::parseFileRange(const char *pathname, off_t bg, off_t ed, int no
 
             if (lines.size() >= 500) {// parse task size
                 transaction_num += lines.size();
+                parse_task_num += 1;
                 when_all_parse.add_task(parse_task(this, node, std::move(lines)), launch_type);
                 lines.clear();
             }
@@ -196,7 +201,12 @@ auto dphim_base::parseFileRange(const char *pathname, off_t bg, off_t ed, int no
     close(fd);
 
     transaction_num += lines.size();
+    parse_task_num += 1;
     when_all_parse.add_task(parse_task(this, node, std::move(lines)), launch_type);
+
+    if (is_debug_mode()) {
+        std::cerr << "# of parse tasks (node: " << node << "): " << parse_task_num << std::endl;
+    }
 
     Transactions res;
     res.reserve(transaction_num);

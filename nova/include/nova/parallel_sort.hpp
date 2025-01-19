@@ -40,9 +40,10 @@ unsigned sort3(Iter x, Iter y, Iter z, Compare cmp) {
     return r;
 }// x <= y && y <= z
 
-template<typename RandomAccessIterator, typename Compare, typename Schedule>
+template<typename RandomAccessIterator, typename Compare, typename Schedule, typename... Args>
 auto parallel_sort(
-        RandomAccessIterator first, RandomAccessIterator last, Compare comp, Schedule &&schedule) -> nova::task<> {
+        RandomAccessIterator first, RandomAccessIterator last,
+        Compare comp, Schedule &&schedule, Args... args) -> nova::task<> {
 
 restart:
 
@@ -52,7 +53,7 @@ restart:
         co_return;
     }
 
-    co_await schedule();
+    co_await schedule(args...);
 
     auto m = first + len / 2;
     auto lm1 = std::prev(last);
@@ -127,8 +128,8 @@ restart:
     }
 
     co_await nova::when_all(
-            parallel_sort(first, i, comp, schedule),
-            parallel_sort(i + 1, last, comp, schedule));
+            parallel_sort(first, i, comp, schedule, args...),
+            parallel_sort(i + 1, last, comp, schedule, args...));
 }
 
 }// namespace nova
